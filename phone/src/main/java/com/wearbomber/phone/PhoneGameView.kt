@@ -121,7 +121,9 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             Screen.CUSTOMIZER -> drawCustomizer(canvas)
             Screen.BUILDER -> drawBuilder(canvas)
         }
-        if (screen == Screen.GAME && blastEffects.isNotEmpty()) postInvalidateOnAnimation()
+        if (screen == Screen.GAME && (bombs.isNotEmpty() || blastEffects.isNotEmpty())) {
+            postInvalidateOnAnimation()
+        }
     }
 
     private fun drawLobby(canvas: Canvas) {
@@ -185,8 +187,17 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         val active = players[activePlayer]
         drawPanel(canvas, RectF(w * .69f, h * .025f, w * .94f, h * .09f),
             Color.rgb(18, 30, 45), Color.rgb(54, 91, 112))
-        text(canvas, "P${activePlayer + 1}  ${active.hp} HP", w * .815f, h * .066f,
-            unit * .024f, Color.rgb(134, 241, 197), true, Paint.Align.CENTER)
+        val maxHp = when {
+            selectedMode == GameMode.JUGGERNAUT && activePlayer == juggernautPlayer -> 2250
+            selectedMode == GameMode.HARDCORE -> 50
+            else -> active.spec.maxHp
+        }
+        text(canvas, "PLAYER ${activePlayer + 1}", w * .715f, h * .052f,
+            unit * .018f, Color.rgb(176, 197, 216), true)
+        text(canvas, "${active.hp} HP", w * .915f, h * .052f,
+            unit * .021f, Color.rgb(134, 241, 197), true, Paint.Align.RIGHT)
+        drawHealthBar(canvas, w * .715f, h * .064f, w * .915f, h * .078f,
+            active.hp.toFloat() / maxHp.coerceAtLeast(1))
         drawBoard(canvas, RectF(w * .045f, h * .115f, w * .955f, h * .555f))
         drawControls(canvas)
         if (raceWon) {
@@ -291,6 +302,17 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         text(canvas, "P2  ${players[1].hp} HP", w * .73f, h * .94f, unit * .023f,
             if (activePlayer == 1) Color.rgb(255, 139, 151) else Color.rgb(165, 181, 197),
             true, Paint.Align.CENTER)
+    }
+
+    private fun drawHealthBar(canvas: Canvas, left: Float, top: Float, right: Float, bottom: Float, health: Float) {
+        bounds.set(left, top, right, bottom)
+        paint.color = Color.rgb(35, 49, 62)
+        canvas.drawRoundRect(bounds, bounds.height() / 2f, bounds.height() / 2f, paint)
+        val fillRight = left + bounds.width() * health.coerceIn(0f, 1f)
+        if (fillRight > left) {
+            paint.color = if (health > .35f) Color.rgb(76, 222, 164) else Color.rgb(255, 105, 92)
+            canvas.drawRoundRect(left, top, fillRight, bottom, bounds.height() / 2f, bounds.height() / 2f, paint)
+        }
     }
 
     private fun drawCustomizer(canvas: Canvas) {
@@ -630,15 +652,30 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
     }
 
     private fun drawBackground(canvas: Canvas) {
-        canvas.drawColor(Color.rgb(6, 11, 20))
-        paint.color = Color.argb(20, 33, 212, 199)
-        canvas.drawCircle(width * .94f, height * .13f, min(width, height) * .33f, paint)
-        paint.color = Color.argb(17, 91, 128, 255)
-        canvas.drawCircle(width * .04f, height * .83f, min(width, height) * .4f, paint)
-        paint.color = Color.argb(16, 141, 181, 208)
-        paint.strokeWidth = maxOf(1f, min(width, height) * .001f)
+        canvas.drawColor(Color.rgb(5, 9, 17))
+        paint.color = Color.argb(22, 23, 205, 190)
+        canvas.drawCircle(width * .92f, height * .14f, min(width, height) * .38f, paint)
+        paint.color = Color.argb(19, 70, 101, 238)
+        canvas.drawCircle(width * .02f, height * .82f, min(width, height) * .46f, paint)
+        paint.color = Color.argb(15, 207, 123, 80)
+        canvas.drawCircle(width * .95f, height * .72f, min(width, height) * .22f, paint)
+
+        val unit = min(width, height).toFloat()
+        paint.color = Color.argb(24, 152, 206, 220)
+        paint.strokeWidth = maxOf(1f, unit * .001f)
         canvas.drawLine(width * .05f, height * .155f, width * .95f, height * .155f, paint)
         canvas.drawLine(width * .05f, height * .895f, width * .95f, height * .895f, paint)
+        paint.color = Color.argb(35, 75, 221, 205)
+        canvas.drawLine(width * .075f, height * .158f, width * .24f, height * .158f, paint)
+        canvas.drawLine(width * .76f, height * .892f, width * .925f, height * .892f, paint)
+
+        for (index in 0 until 36) {
+            val x = ((index * 83 + 31) % 997) / 997f * width
+            val y = ((index * 137 + 59) % 991) / 991f * height
+            val alpha = 18 + index % 4 * 7
+            paint.color = Color.argb(alpha, 172, 210, 225)
+            canvas.drawCircle(x, y, unit * if (index % 7 == 0) .0022f else .0012f, paint)
+        }
     }
 
     private fun drawBrand(canvas: Canvas, x: Float, y: Float, size: Float) {
@@ -695,39 +732,55 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             Tile.FLOOR -> {
                 paint.color = if ((x + y) % 2 == 0) Color.rgb(21, 39, 47) else Color.rgb(25, 45, 52)
                 canvas.drawRoundRect(rect, cell * .07f, cell * .07f, paint)
-                paint.color = Color.argb(36, 124, 191, 194)
-                canvas.drawCircle(left + cell * .17f, top + cell * .17f, cell * .035f, paint)
+                paint.color = Color.argb(24, 130, 205, 204)
+                canvas.drawRoundRect(left + cell * .1f, top + cell * .1f,
+                    right - cell * .1f, bottom - cell * .1f, cell * .045f, cell * .045f, paint)
+                paint.color = Color.argb(58, 124, 191, 194)
+                canvas.drawCircle(left + cell * .18f, top + cell * .18f, cell * .035f, paint)
+                canvas.drawCircle(right - cell * .18f, bottom - cell * .18f, cell * .035f, paint)
             }
             Tile.STEEL -> {
-                paint.color = Color.rgb(63, 83, 100)
+                paint.color = Color.rgb(36, 54, 70)
                 canvas.drawRoundRect(rect, cell * .1f, cell * .1f, paint)
-                paint.color = Color.rgb(106, 133, 149)
+                paint.color = Color.rgb(92, 123, 144)
                 canvas.drawRoundRect(left + cell * .08f, top + cell * .07f, right - cell * .08f,
-                    bottom - cell * .16f, cell * .07f, cell * .07f, paint)
-                paint.color = Color.rgb(63, 83, 100)
-                canvas.drawRoundRect(left + cell * .17f, top + cell * .17f, right - cell * .17f,
-                    bottom - cell * .22f, cell * .045f, cell * .045f, paint)
-                paint.color = Color.rgb(171, 201, 211)
-                canvas.drawCircle(left + cell * .22f, top + cell * .2f, cell * .035f, paint)
-                canvas.drawCircle(right - cell * .22f, bottom - cell * .25f, cell * .035f, paint)
+                    bottom - cell * .08f, cell * .07f, cell * .07f, paint)
+                paint.color = Color.rgb(53, 74, 91)
+                canvas.drawRoundRect(left + cell * .15f, top + cell * .15f, right - cell * .15f,
+                    bottom - cell * .15f, cell * .045f, cell * .045f, paint)
+                paint.color = Color.argb(100, 191, 224, 235)
+                canvas.drawLine(left + cell * .2f, top + cell * .1f, right - cell * .2f,
+                    top + cell * .1f, paint.apply { strokeWidth = maxOf(1f, cell * .025f) })
+                paint.color = Color.rgb(174, 207, 219)
+                for ((boltX, boltY) in listOf(.2f to .2f, .8f to .2f, .2f to .8f, .8f to .8f)) {
+                    canvas.drawCircle(left + cell * boltX, top + cell * boltY, cell * .035f, paint)
+                }
             }
             Tile.BRICK -> {
-                paint.color = Color.rgb(118, 55, 45)
+                paint.color = Color.rgb(91, 40, 39)
                 canvas.drawRoundRect(rect, cell * .08f, cell * .08f, paint)
-                paint.color = Color.rgb(191, 83, 58)
+                paint.color = Color.rgb(173, 71, 54)
                 canvas.drawRoundRect(left + cell * .06f, top + cell * .06f, right - cell * .06f,
                     bottom - cell * .08f, cell * .055f, cell * .055f, paint)
-                paint.color = Color.rgb(131, 57, 48)
+                paint.color = Color.rgb(107, 48, 43)
                 canvas.drawRect(left + cell * .06f, top + cell * .48f, right - cell * .06f,
-                    top + cell * .55f, paint)
-                canvas.drawRect(left + cell * .46f, top + cell * .06f, left + cell * .53f,
+                    top + cell * .53f, paint)
+                canvas.drawRect(left + cell * .47f, top + cell * .06f, left + cell * .52f,
                     top + cell * .48f, paint)
-                canvas.drawRect(left + cell * .29f, top + cell * .55f, left + cell * .36f,
+                canvas.drawRect(left + cell * .29f, top + cell * .53f, left + cell * .34f,
                     bottom - cell * .08f, paint)
+                paint.color = Color.argb(90, 255, 177, 127)
+                canvas.drawLine(left + cell * .12f, top + cell * .12f, right - cell * .12f,
+                    top + cell * .12f, paint.apply { strokeWidth = maxOf(1f, cell * .025f) })
             }
             Tile.TELEPORT -> {
                 paint.color = Color.rgb(50, 27, 85)
                 canvas.drawRoundRect(rect, cell * .1f, cell * .1f, paint)
+                paint.style = Paint.Style.STROKE
+                paint.strokeWidth = maxOf(1f, cell * .055f)
+                paint.color = Color.argb(120, 213, 147, 255)
+                canvas.drawCircle(rect.centerX(), rect.centerY(), cell * .38f, paint)
+                paint.style = Paint.Style.FILL
                 paint.color = Color.rgb(160, 77, 228)
                 canvas.drawCircle(rect.centerX(), rect.centerY(), cell * .36f, paint)
                 paint.color = Color.rgb(75, 43, 134)
@@ -738,6 +791,11 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             Tile.GOAL -> {
                 paint.color = Color.rgb(82, 61, 26)
                 canvas.drawRoundRect(rect, cell * .1f, cell * .1f, paint)
+                paint.style = Paint.Style.STROKE
+                paint.strokeWidth = maxOf(1f, cell * .05f)
+                paint.color = Color.argb(150, 255, 225, 141)
+                canvas.drawCircle(rect.centerX(), rect.centerY(), cell * .39f, paint)
+                paint.style = Paint.Style.FILL
                 paint.color = Color.rgb(255, 195, 61)
                 canvas.drawCircle(rect.centerX(), rect.centerY(), cell * .36f, paint)
                 paint.color = Color.rgb(255, 232, 150)
@@ -749,19 +807,29 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
     }
 
     private fun drawBomb(canvas: Canvas, cx: Float, cy: Float, cell: Float) {
+        val pulse = 1f + .07f * kotlin.math.sin(SystemClock.uptimeMillis() / 95f)
         paint.color = Color.argb(100, 0, 0, 0)
-        canvas.drawOval(cx - cell * .32f, cy + cell * .17f, cx + cell * .32f, cy + cell * .32f, paint)
-        paint.color = Color.rgb(18, 24, 35)
-        canvas.drawCircle(cx, cy, cell * .3f, paint)
-        paint.color = Color.rgb(65, 77, 94)
-        canvas.drawCircle(cx - cell * .09f, cy - cell * .1f, cell * .075f, paint)
+        canvas.drawOval(cx - cell * .34f, cy + cell * .17f, cx + cell * .34f, cy + cell * .34f, paint)
+        paint.color = Color.rgb(7, 11, 18)
+        canvas.drawCircle(cx, cy, cell * .32f * pulse, paint)
+        paint.color = Color.rgb(37, 49, 65)
+        canvas.drawCircle(cx, cy - cell * .025f, cell * .27f * pulse, paint)
+        paint.color = Color.rgb(91, 111, 130)
+        canvas.drawCircle(cx - cell * .1f, cy - cell * .11f, cell * .075f * pulse, paint)
         paint.color = Color.rgb(201, 116, 51)
         canvas.drawLine(cx + cell * .12f, cy - cell * .24f, cx + cell * .24f, cy - cell * .38f, paint.apply {
             strokeWidth = cell * .055f
             strokeCap = Paint.Cap.ROUND
         })
-        paint.color = Color.rgb(255, 195, 72)
-        canvas.drawCircle(cx + cell * .25f, cy - cell * .4f, cell * .055f, paint)
+        val fuseColor = if (SystemClock.uptimeMillis() % 360L < 180L) {
+            Color.rgb(255, 91, 61)
+        } else {
+            Color.rgb(255, 218, 91)
+        }
+        paint.color = Color.argb(90, 255, 148, 57)
+        canvas.drawCircle(cx + cell * .25f, cy - cell * .4f, cell * .12f, paint)
+        paint.color = fuseColor
+        canvas.drawCircle(cx + cell * .25f, cy - cell * .4f, cell * .06f, paint)
         paint.strokeCap = Paint.Cap.BUTT
     }
 
@@ -789,6 +857,13 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
                 paint.style = Paint.Style.FILL
                 paint.color = Color.argb(alpha, 255, 238, 166)
                 canvas.drawCircle(cx, cy, cell * (.2f + .18f * (1f - progress)), paint)
+                paint.color = Color.argb(alpha * 3 / 4, 255, 124, 49)
+                for (spark in 0 until 6) {
+                    val angle = spark * (Math.PI.toFloat() / 3f) + progress * 2f
+                    val distance = cell * (.42f + progress * .38f)
+                    canvas.drawCircle(cx + kotlin.math.cos(angle) * distance,
+                        cy + kotlin.math.sin(angle) * distance, cell * .035f * (1f - progress), paint)
+                }
             }
             index--
         }
@@ -817,15 +892,26 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         bounds.set(cx - radius * .72f, cy - radius * .72f, cx + radius * .72f, cy + radius * .72f)
         paint.color = color
         canvas.drawRoundRect(bounds, radius * .48f, radius * .48f, paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = maxOf(1f, radius * .07f)
+        paint.color = Color.argb(190, 9, 20, 31)
+        canvas.drawRoundRect(bounds, radius * .48f, radius * .48f, paint)
+        paint.style = Paint.Style.FILL
         paint.color = Color.argb(110, 255, 255, 255)
         canvas.drawRoundRect(bounds.left + radius * .12f, bounds.top + radius * .1f,
             bounds.right - radius * .12f, bounds.top + radius * .3f, radius * .12f, radius * .12f, paint)
+        paint.color = Color.argb(90, 9, 28, 44)
+        canvas.drawRoundRect(bounds.left + radius * .08f, cy + radius * .42f,
+            bounds.right - radius * .08f, cy + radius * .58f, radius * .06f, radius * .06f, paint)
         paint.color = Color.WHITE
         canvas.drawCircle(cx - radius * .24f, cy - radius * .05f, radius * .16f, paint)
         canvas.drawCircle(cx + radius * .24f, cy - radius * .05f, radius * .16f, paint)
         paint.color = Color.rgb(13, 23, 33)
         canvas.drawCircle(cx - radius * .2f, cy - radius * .04f, radius * .07f, paint)
         canvas.drawCircle(cx + radius * .28f, cy - radius * .04f, radius * .07f, paint)
+        paint.color = Color.WHITE
+        canvas.drawCircle(cx - radius * .22f, cy - radius * .075f, radius * .025f, paint)
+        canvas.drawCircle(cx + radius * .26f, cy - radius * .075f, radius * .025f, paint)
         drawAccessory(canvas, cx, cy, radius * .8f, accessory)
         text(canvas, label, cx, cy + radius * .52f, radius * .31f, Color.WHITE, true, Paint.Align.CENTER)
     }
@@ -848,8 +934,8 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         paint.color = color
         canvas.drawRoundRect(l, t, r, b, radius, radius, paint)
         paint.style = Paint.Style.STROKE
-        paint.strokeWidth = maxOf(1f, unit * .0015f)
-        paint.color = Color.argb(75, 220, 244, 255)
+        paint.strokeWidth = maxOf(1f, unit * .002f)
+        paint.color = Color.argb(175, 116, 217, 220)
         canvas.drawRoundRect(l, t, r, b, radius, radius, paint)
         paint.style = Paint.Style.FILL
         paint.color = Color.argb(26, 255, 255, 255)
