@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.view.View
 import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
 private val GAME_UUID: UUID = UUID.fromString("8ce255c0-200a-11e0-ac64-0800200c9a66")
@@ -20,6 +21,9 @@ class PhoneActivity : Activity() {
     private var serverSocket: BluetoothServerSocket? = null
     private var clientSocket: BluetoothSocket? = null
     private val bluetoothRequest = 73
+    private val sendExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "WearBomber-RFCOMM-send")
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,7 +82,7 @@ class PhoneActivity : Activity() {
 
     private fun sendCommand(command: String) {
         val socket = clientSocket ?: return
-        thread(name = "WearBomber-RFCOMM-send") {
+        sendExecutor.execute {
             try {
                 socket.outputStream.write("$command\n".toByteArray())
                 socket.outputStream.flush()
@@ -97,6 +101,7 @@ class PhoneActivity : Activity() {
         } catch (_: IOException) {
             // Closing during Activity teardown is best-effort.
         }
+        sendExecutor.shutdownNow()
         super.onDestroy()
     }
 }

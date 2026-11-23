@@ -1,7 +1,6 @@
 package com.wearbomber.watch
 
 import android.Manifest
-import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothSocket
@@ -9,15 +8,21 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.View
+import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
 private val GAME_UUID: UUID = UUID.fromString("8ce255c0-200a-11e0-ac64-0800200c9a66")
 
-class WatchActivity : Activity() {
+class WatchActivity : ComponentActivity() {
     private lateinit var gameView: WatchGameView
     private var socket: BluetoothSocket? = null
+    private val sendExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "WearBomber-RFCOMM-send")
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -26,6 +31,11 @@ class WatchActivity : Activity() {
                 View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
         gameView = WatchGameView(this, ::sendCommand, ::connectToPhone)
         setContentView(gameView)
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (!gameView.consumeBackGesture()) finish()
+            }
+        })
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
             checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -79,7 +89,7 @@ class WatchActivity : Activity() {
             gameView.setConnectionStatus("Not connected — tap CONNECT")
             return
         }
-        thread(name = "WearBomber-RFCOMM-send") {
+        sendExecutor.execute {
             try {
                 current.outputStream.write("$command\n".toByteArray())
                 current.outputStream.flush()
@@ -97,6 +107,7 @@ class WatchActivity : Activity() {
         } catch (_: IOException) {
             // Closing during Activity teardown is best-effort.
         }
+        sendExecutor.shutdownNow()
         super.onDestroy()
     }
 }
