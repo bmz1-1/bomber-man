@@ -34,17 +34,23 @@ private enum class Outfit(val color: Int) {
 
 private enum class Accessory { NONE, CROWN, HORNS, HALO, VISOR, TOP_HAT }
 private enum class Perk { NONE, SHIELD, KICK, PIERCE }
-private enum class Debuff(val code: String, val displayName: String, val color: Int, val symbol: String) {
-    SLOW("SL", "Sluggish", Color.rgb(174, 166, 91), "S"),
-    REVERSE("RV", "Dizzy", Color.rgb(207, 109, 145), "R"),
-    WEAK_FLAME("WF", "Weak Flame", Color.rgb(197, 112, 82), "W"),
-    BOMB_LOCK("BL", "Bomb Lock", Color.rgb(144, 124, 174), "L"),
-    STUN("ST", "Stun", Color.rgb(224, 172, 75), "!"),
-    FRAGILE("FR", "Fragile", Color.rgb(224, 99, 99), "F"),
-    POISON("PS", "Poison", Color.rgb(112, 194, 106), "P"),
-    SHIELD_BREAK("SB", "Shield Break", Color.rgb(92, 152, 199), "X"),
-    DASH_DRAIN("DD", "Dash Drain", Color.rgb(105, 179, 179), "D"),
-    CURSE("CR", "Curse", Color.rgb(156, 110, 183), "C");
+private enum class Debuff(
+    val code: String,
+    val displayName: String,
+    val color: Int,
+    val symbol: String,
+    val durationMillis: Long
+) {
+    SLOW("SL", "Sluggish", Color.rgb(174, 166, 91), "S", 10_000L),
+    REVERSE("RV", "Dizzy", Color.rgb(207, 109, 145), "R", 10_000L),
+    WEAK_FLAME("WF", "Weak Flame", Color.rgb(197, 112, 82), "W", 20_000L),
+    BOMB_LOCK("BL", "Bomb Lock", Color.rgb(144, 124, 174), "L", 10_000L),
+    STUN("ST", "Stun", Color.rgb(224, 172, 75), "!", 3_000L),
+    FRAGILE("FR", "Fragile", Color.rgb(224, 99, 99), "F", 15_000L),
+    POISON("PS", "Poison", Color.rgb(112, 194, 106), "P", 15_000L),
+    SHIELD_BREAK("SB", "Shield Break", Color.rgb(92, 152, 199), "X", 0L),
+    DASH_DRAIN("DD", "Dash Drain", Color.rgb(105, 179, 179), "D", 15_000L),
+    CURSE("CR", "Curse", Color.rgb(156, 110, 183), "C", 0L);
 
     companion object {
         fun fromCode(code: String): Debuff? = entries.firstOrNull { it.code == code }
@@ -91,10 +97,11 @@ private data class Player(
     var piercingFlame: Boolean = false,
     val collectedPowerUps: MutableSet<String> = mutableSetOf(),
     val collectedDebuffs: MutableSet<String> = mutableSetOf(),
-    var slowMoves: Int = 0,
-    var reverseMoves: Int = 0,
-    var stunMoves: Int = 0,
-    var poisonMoves: Int = 0,
+    val activeDebuffs: MutableMap<Debuff, Long> = mutableMapOf(),
+    val reversibleDebuffs: MutableSet<Debuff> = mutableSetOf(),
+    var lastWalkAt: Long = 0L,
+    var walkFromX: Int = x,
+    var walkFromY: Int = y,
     var vulnerableHits: Int = 0,
     var bombLocked: Boolean = false
 )
@@ -175,6 +182,13 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             startGame()
             return
         }
+        if (command.startsWith("CHAIN:")) {
+            val values = command.substringAfter(':').split(':')
+            val x = values.getOrNull(0)?.toIntOrNull() ?: return
+            val y = values.getOrNull(1)?.toIntOrNull() ?: return
+            bombs.firstOrNull { it.x == x && it.y == y }?.let { detonate(it, fromChain = true) }
+            return
+        }
         activePlayer = 1
         handlingRemoteCommand = true
         try {
@@ -204,6 +218,8 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+        val now = SystemClock.uptimeMillis()
+        players.forEach { expireDebuffs(it, now) }
         drawBackground(canvas)
         val transitionProgress = if (screenTransitionStartedAt == 0L) 1f else {
             ((SystemClock.uptimeMillis() - screenTransitionStartedAt).toFloat() / SCREEN_TRANSITION_DURATION)
@@ -232,6 +248,12 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         if (screen == Screen.GAME && (bombs.isNotEmpty() || blastEffects.isNotEmpty() ||
                 SystemClock.uptimeMillis() < powerUpMessageUntil)
         ) {
+            postInvalidateOnAnimation()
+        }
+        if (screen == Screen.GAME && players.any { it.activeDebuffs.isNotEmpty() }) {
+            postInvalidateDelayed(250L)
+        }
+        if (screen == Screen.GAME && players.any { now - it.lastWalkAt in 0L..420L }) {
             postInvalidateOnAnimation()
         }
     }
@@ -375,13 +397,28 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
                 cell, bomb.plantedAt)
         }
         drawBlastEffects(canvas, left, top, cell)
+        val now = SystemClock.uptimeMillis()
         players.forEachIndexed { index, player ->
             if (selectedMode == GameMode.SOLO && index == 1) return@forEachIndexed
-            val cx = left + (player.x + .5f) * cell
-            val cy = top + (player.y + .5f) * cell
+            val walkProgress = ((now - player.lastWalkAt) / 170f).coerceIn(0f, 1f)
+            val visualX = if (walkProgress < 1f) {
+                player.walkFromX + (player.x - player.walkFromX) * walkProgress
+            } else player.x.toFloat()
+            val visualY = if (walkProgress < 1f) {
+                player.walkFromY + (player.y - player.walkFromY) * walkProgress
+            } else player.y.toFloat()
+            val cx = left + (visualX + .5f) * cell
+            val cy = top + (visualY + .5f) * cell
             val size = cell * if (selectedMode == GameMode.JUGGERNAUT && index == juggernautPlayer) .86f else .7f
+            val maxHp = when {
+                selectedMode == GameMode.JUGGERNAUT && index == juggernautPlayer -> 2250
+                selectedMode == GameMode.HARDCORE -> 50
+                else -> player.spec.maxHp
+            }
             drawCharacter(canvas, cx, cy, size, player.spec.outfit.color, player.spec.accessory,
-                "${index + 1}", player.shieldCharges > 0)
+                "${index + 1}", player.shieldCharges > 0,
+                walking = SystemClock.uptimeMillis() - player.lastWalkAt in 0L..420L,
+                healthRatio = player.hp.toFloat() / maxHp)
             if (selectedMode == GameMode.JUGGERNAUT && index == juggernautPlayer) {
                 text(canvas, "${player.hp}", cx, cy + cell * .47f, cell * .2f, Color.WHITE, true, Paint.Align.CENTER)
             }
@@ -418,16 +455,18 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             centerX + buttonSize / 2, centerY + buttonSize * 1.2f, Color.rgb(42, 75, 96))
         button(canvas, "→", centerX + buttonSize * .2f, centerY - buttonSize / 2,
             centerX + buttonSize * 1.2f, centerY + buttonSize / 2, Color.rgb(42, 75, 96))
-        button(canvas, "✹  PLACE BOMB", w * .58f, top + h * .06f, w * .93f,
+        val active = players[activePlayer]
+        val bombsPlaced = bombs.count { it.owner == activePlayer }
+        val bombLabel = if (active.bombLocked) "✹  BOMB LOCKED"
+            else "✹  PLACE BOMB  $bombsPlaced/${active.bombCapacity}"
+        button(canvas, bombLabel, w * .58f, top + h * .06f, w * .93f,
             top + h * .17f, Color.rgb(174, 66, 54))
         text(canvas, "LOADOUT", w * .755f, top + h * .225f, unit * .019f,
             Color.rgb(128, 155, 179), true, Paint.Align.CENTER)
-        val active = players[activePlayer]
         val powerUpCodes = active.collectedPowerUps.toList().takeLast(6)
-        val debuffCodes = active.collectedDebuffs.toList().takeLast(6)
         text(canvas, if (powerUpCodes.isEmpty()) "Power-ups: none" else "Power-ups: ${powerUpCodes.joinToString(" ")}",
             w * .585f, top + h * .265f, unit * .015f, Color.rgb(135, 224, 185))
-        text(canvas, if (debuffCodes.isEmpty()) "Debuffs: none" else "Debuffs: ${debuffCodes.joinToString(" ")}",
+        text(canvas, activeDebuffSummary(active, SystemClock.uptimeMillis()),
             w * .585f, top + h * .30f, unit * .015f, Color.rgb(240, 151, 145))
         text(canvas, "P1  ${players[0].hp} HP", w * .27f, h * .94f, unit * .023f,
             if (activePlayer == 0) Color.rgb(125, 232, 203) else Color.rgb(165, 181, 197),
@@ -541,7 +580,7 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         drawScreenTitle(canvas, "HOW TO PLAY", "Quick guide to the arena")
         val tips = listOf(
             "MOVE" to "Tap or hold a D-pad direction to walk.",
-            "BOMBS" to "Bombs explode automatically after 3 seconds.",
+            "BOMBS" to "3-second fuse; blasts can trigger other bombs.",
             "POWER-UPS" to "Break bricks and collect upgrades for your bomber.",
             "MATCHES" to "Choose a mode and map, then start a local match.",
             "BLUETOOTH" to "Host on your phone, then connect a paired watch."
@@ -923,18 +962,18 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
     private fun movePlayer(dx: Int, dy: Int) {
         if (screen != Screen.GAME) return
         val player = players[activePlayer]
-        if (player.stunMoves > 0) {
-            player.stunMoves--
+        expireDebuffs(player, SystemClock.uptimeMillis())
+        if (Debuff.STUN in player.activeDebuffs) {
             invalidate()
             return
         }
-        val moveDx = if (player.reverseMoves > 0) -dx else dx
-        val moveDy = if (player.reverseMoves > 0) -dy else dy
+        val moveDx = if (Debuff.REVERSE in player.activeDebuffs) -dx else dx
+        val moveDy = if (Debuff.REVERSE in player.activeDebuffs) -dy else dy
         val now = System.currentTimeMillis()
         val baseCooldown = if (selectedMode == GameMode.JUGGERNAUT && activePlayer == juggernautPlayer) {
             850L
         } else {
-            player.spec.speed.cooldown + if (player.slowMoves > 0) 220L else 0L
+            player.spec.speed.cooldown + if (Debuff.SLOW in player.activeDebuffs) 220L else 0L
         }
         val cooldown = (baseCooldown - player.dashLevel * 65L).coerceAtLeast(120L)
         if (now - player.lastMoveAt < cooldown) return
@@ -964,13 +1003,13 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             board[ny][nx] = Tile.FLOOR
             sendToWatch("BREAK:$nx:$ny")
         } else if (board[ny][nx] == Tile.BRICK) return
+        player.walkFromX = player.x
+        player.walkFromY = player.y
         player.x = nx
         player.y = ny
         player.lastMoveAt = now
-        if (player.reverseMoves > 0) player.reverseMoves--
-        if (player.slowMoves > 0) player.slowMoves--
-        if (player.poisonMoves > 0) {
-            player.poisonMoves--
+        player.lastWalkAt = SystemClock.uptimeMillis()
+        if (Debuff.POISON in player.activeDebuffs) {
             player.hp = (player.hp - 5).coerceAtLeast(0)
             if (player.hp == 0) {
                 finishMatch(if (selectedMode == GameMode.SOLO) null else 1 - activePlayer, "Poison defeated Player ${activePlayer + 1}.")
@@ -985,6 +1024,8 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             ) {
                 player.x = teleportX
                 player.y = teleportY
+                player.walkFromX = teleportX
+                player.walkFromY = teleportY
             }
         }
         droppedItems.remove(nx to ny)?.let { collectPowerUp(player, it) }
@@ -1000,6 +1041,7 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
     private fun placeBomb() {
         if (screen != Screen.GAME) return
         val player = players[activePlayer]
+        expireDebuffs(player, SystemClock.uptimeMillis())
         if (player.bombLocked) {
             lastPowerUpMessage = "BOMB LOCKED"
             powerUpMessageUntil = SystemClock.uptimeMillis() + 1400L
@@ -1063,21 +1105,60 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
 
     private fun applyDebuff(player: Player, debuff: Debuff) {
         player.collectedDebuffs.add(debuff.code)
+        val now = SystemClock.uptimeMillis()
+        expireDebuffs(player, now)
+        val alreadyActive = debuff in player.activeDebuffs
+        if (debuff.durationMillis > 0L) {
+            player.activeDebuffs[debuff] = now + debuff.durationMillis
+        }
         when (debuff) {
-            Debuff.SLOW -> player.slowMoves = 5
-            Debuff.REVERSE -> player.reverseMoves = 5
-            Debuff.WEAK_FLAME -> player.blastRange = (player.blastRange - 1).coerceAtLeast(1)
+            Debuff.WEAK_FLAME -> if (!alreadyActive && player.blastRange > 1) {
+                player.blastRange--
+                player.reversibleDebuffs.add(debuff)
+            }
             Debuff.BOMB_LOCK -> player.bombLocked = true
-            Debuff.STUN -> player.stunMoves = 1
             Debuff.FRAGILE -> player.vulnerableHits = 2
-            Debuff.POISON -> player.poisonMoves = 5
             Debuff.SHIELD_BREAK -> player.shieldCharges = 0
-            Debuff.DASH_DRAIN -> player.dashLevel = (player.dashLevel - 1).coerceAtLeast(0)
+            Debuff.DASH_DRAIN -> if (!alreadyActive && player.dashLevel > 0) {
+                player.dashLevel--
+                player.reversibleDebuffs.add(debuff)
+            }
             Debuff.CURSE -> player.hp = (player.hp - 25).coerceAtLeast(0)
+            Debuff.SLOW, Debuff.REVERSE, Debuff.STUN, Debuff.POISON -> Unit
         }
         if (player.hp == 0) {
             finishMatch(if (selectedMode == GameMode.SOLO) null else 1 - activePlayer, "A curse defeated Player ${activePlayer + 1}.")
         }
+    }
+
+    private fun expireDebuffs(player: Player, now: Long) {
+        val expired = player.activeDebuffs.filterValues { it <= now }.keys
+        expired.forEach { debuff ->
+            player.activeDebuffs.remove(debuff)
+            when (debuff) {
+                Debuff.BOMB_LOCK -> player.bombLocked = false
+                Debuff.FRAGILE -> player.vulnerableHits = 0
+                else -> Unit
+            }
+            if (player.reversibleDebuffs.remove(debuff)) {
+                when (debuff) {
+                    Debuff.WEAK_FLAME -> player.blastRange = (player.blastRange + 1).coerceAtMost(8)
+                    Debuff.DASH_DRAIN -> player.dashLevel = (player.dashLevel + 1).coerceAtMost(4)
+                    else -> Unit
+                }
+            }
+        }
+    }
+
+    private fun activeDebuffSummary(player: Player, now: Long): String {
+        val effects = player.activeDebuffs.entries
+            .sortedBy { it.value }
+            .take(4)
+            .joinToString(" ") { (debuff, expiresAt) ->
+                val seconds = ((expiresAt - now).coerceAtLeast(0L) + 999L) / 1000L
+                "${debuff.code} ${seconds}s"
+            }
+        return if (effects.isEmpty()) "Debuffs: none" else "Debuffs: $effects"
     }
 
     private fun randomSafeFloor(): Pair<Int, Int> {
@@ -1090,8 +1171,8 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         return safeFloors.randomOrNull() ?: (players[activePlayer].x to players[activePlayer].y)
     }
 
-    private fun detonate(bomb: Bomb) {
-        if (!bombs.contains(bomb)) return
+    private fun detonate(bomb: Bomb, fromChain: Boolean = false) {
+        if (screen != Screen.GAME || !bombs.contains(bomb)) return
         val now = SystemClock.uptimeMillis()
         val directions = listOf(1 to 0, -1 to 0, 0 to 1, 0 to -1)
         val owner = players[bomb.owner]
@@ -1148,6 +1229,10 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
                 }
             }
         }
+        bombs.filter { it != bomb && (it.x to it.y) in affectedCells }.toList().forEach { chained ->
+            if (!fromChain) sendToWatch("CHAIN:${chained.x}:${chained.y}")
+            post { detonate(chained, fromChain = true) }
+        }
         if (selectedMode == GameMode.SPLEEF) {
             affectedCells.forEach { (x, y) -> if (x in board.indices && y in board.indices) board[y][x] = Tile.HOLE }
         }
@@ -1171,8 +1256,11 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
                     player.x = if (index == 0) 1 else last
                     player.y = if (index == 0) 1 else last
                 } else {
-                    val damage = if (player.vulnerableHits > 0) 100 else 50
-                    if (player.vulnerableHits > 0) player.vulnerableHits--
+                    val damage = if (Debuff.FRAGILE in player.activeDebuffs && player.vulnerableHits > 0) 100 else 50
+                    if (player.vulnerableHits > 0) {
+                        player.vulnerableHits--
+                        if (player.vulnerableHits == 0) player.activeDebuffs.remove(Debuff.FRAGILE)
+                    }
                     player.hp = (player.hp - damage).coerceAtLeast(0)
                 }
                 if (index != bomb.owner && owner.vampireFlame) {
@@ -1459,9 +1547,12 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         color: Int,
         accessory: Accessory,
         label: String,
-        shielded: Boolean = false
+        shielded: Boolean = false,
+        walking: Boolean = false,
+        healthRatio: Float? = null
     ) {
         val radius = size * .5f
+        val walk = if (walking) kotlin.math.sin(SystemClock.uptimeMillis() / 65f) else 0f
         if (shielded) {
             paint.style = Paint.Style.STROKE
             paint.strokeWidth = maxOf(1f, radius * .08f)
@@ -1470,33 +1561,70 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             paint.style = Paint.Style.FILL
         }
         paint.color = Color.argb(100, 0, 0, 0)
-        canvas.drawOval(cx - radius * .72f, cy + radius * .6f, cx + radius * .72f,
-            cy + radius * .95f, paint)
-        bounds.set(cx - radius * .72f, cy - radius * .72f, cx + radius * .72f, cy + radius * .72f)
+        canvas.drawOval(cx - radius * .62f, cy + radius * .78f, cx + radius * .62f,
+            cy + radius * .98f, paint)
+
+        paint.color = Color.rgb(
+            (Color.red(color) * .68f).toInt(),
+            (Color.green(color) * .68f).toInt(),
+            (Color.blue(color) * .68f).toInt()
+        )
+        paint.strokeWidth = maxOf(1f, radius * .13f)
+        paint.strokeCap = Paint.Cap.ROUND
+        canvas.drawLine(cx - radius * .16f, cy + radius * .37f,
+            cx - radius * (.18f + walk * .18f), cy + radius * .86f, paint)
+        canvas.drawLine(cx + radius * .16f, cy + radius * .37f,
+            cx + radius * (.18f - walk * .18f), cy + radius * .86f, paint)
+        canvas.drawLine(cx - radius * .3f, cy - radius * .1f,
+            cx - radius * (.48f - walk * .2f), cy + radius * (.28f + walk * .08f), paint)
+        canvas.drawLine(cx + radius * .3f, cy - radius * .1f,
+            cx + radius * (.48f + walk * .2f), cy + radius * (.28f - walk * .08f), paint)
+        paint.strokeCap = Paint.Cap.BUTT
+
+        bounds.set(cx - radius * .34f, cy - radius * .24f, cx + radius * .34f, cy + radius * .48f)
         paint.color = color
-        canvas.drawRoundRect(bounds, radius * .48f, radius * .48f, paint)
+        canvas.drawRoundRect(bounds, radius * .16f, radius * .16f, paint)
         paint.style = Paint.Style.STROKE
-        paint.strokeWidth = maxOf(1f, radius * .07f)
+        paint.strokeWidth = maxOf(1f, radius * .045f)
         paint.color = Color.argb(190, 9, 20, 31)
-        canvas.drawRoundRect(bounds, radius * .48f, radius * .48f, paint)
+        canvas.drawRoundRect(bounds, radius * .16f, radius * .16f, paint)
         paint.style = Paint.Style.FILL
         paint.color = Color.argb(110, 255, 255, 255)
         canvas.drawRoundRect(bounds.left + radius * .12f, bounds.top + radius * .1f,
-            bounds.right - radius * .12f, bounds.top + radius * .3f, radius * .12f, radius * .12f, paint)
-        paint.color = Color.argb(90, 9, 28, 44)
-        canvas.drawRoundRect(bounds.left + radius * .08f, cy + radius * .42f,
-            bounds.right - radius * .08f, cy + radius * .58f, radius * .06f, radius * .06f, paint)
+            bounds.right - radius * .12f, bounds.top + radius * .22f, radius * .08f, radius * .08f, paint)
+        paint.color = color
+        canvas.drawCircle(cx, cy - radius * .48f, radius * .24f, paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = maxOf(1f, radius * .04f)
+        paint.color = Color.argb(190, 9, 20, 31)
+        canvas.drawCircle(cx, cy - radius * .48f, radius * .24f, paint)
+        paint.style = Paint.Style.FILL
         paint.color = Color.WHITE
-        canvas.drawCircle(cx - radius * .24f, cy - radius * .05f, radius * .16f, paint)
-        canvas.drawCircle(cx + radius * .24f, cy - radius * .05f, radius * .16f, paint)
+        canvas.drawCircle(cx - radius * .09f, cy - radius * .5f, radius * .06f, paint)
+        canvas.drawCircle(cx + radius * .09f, cy - radius * .5f, radius * .06f, paint)
         paint.color = Color.rgb(13, 23, 33)
-        canvas.drawCircle(cx - radius * .2f, cy - radius * .04f, radius * .07f, paint)
-        canvas.drawCircle(cx + radius * .28f, cy - radius * .04f, radius * .07f, paint)
-        paint.color = Color.WHITE
-        canvas.drawCircle(cx - radius * .22f, cy - radius * .075f, radius * .025f, paint)
-        canvas.drawCircle(cx + radius * .26f, cy - radius * .075f, radius * .025f, paint)
-        drawAccessory(canvas, cx, cy, radius * .8f, accessory)
-        text(canvas, label, cx, cy + radius * .52f, radius * .31f, Color.WHITE, true, Paint.Align.CENTER)
+        canvas.drawCircle(cx - radius * .08f, cy - radius * .5f, radius * .025f, paint)
+        canvas.drawCircle(cx + radius * .1f, cy - radius * .5f, radius * .025f, paint)
+        drawAccessory(canvas, cx, cy - radius * .48f, radius * .3f, accessory)
+        text(canvas, label, cx, cy + radius * .34f, radius * .24f, Color.WHITE, true, Paint.Align.CENTER)
+        healthRatio?.let { ratio ->
+            val barWidth = radius * 1.6f
+            val barHeight = maxOf(1f, radius * .14f)
+            val barTop = cy - radius * 1.15f
+            bounds.set(cx - barWidth / 2f, barTop, cx + barWidth / 2f, barTop + barHeight)
+            paint.color = Color.argb(210, 8, 14, 22)
+            canvas.drawRoundRect(bounds, barHeight / 2f, barHeight / 2f, paint)
+            val fillWidth = barWidth * ratio.coerceIn(0f, 1f)
+            if (fillWidth > 0f) {
+                bounds.set(cx - barWidth / 2f, barTop, cx - barWidth / 2f + fillWidth, barTop + barHeight)
+                paint.color = when {
+                    ratio > .6f -> Color.rgb(85, 225, 145)
+                    ratio > .3f -> Color.rgb(255, 190, 75)
+                    else -> Color.rgb(255, 89, 92)
+                }
+                canvas.drawRoundRect(bounds, barHeight / 2f, barHeight / 2f, paint)
+            }
+        }
     }
 
     private fun lobbyCardTop() = height * .16f
