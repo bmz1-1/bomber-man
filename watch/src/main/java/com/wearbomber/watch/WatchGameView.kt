@@ -15,8 +15,25 @@ import kotlin.math.min
 import kotlin.math.sin
 import kotlin.random.Random
 
-private enum class WatchTile { FLOOR, STEEL, BRICK, TELEPORT, GOAL }
-private enum class WatchScreen { GAME, SETTINGS }
+private enum class WatchTile { FLOOR, STEEL, BRICK, TELEPORT, GOAL, HOLE }
+private enum class WatchScreen { GAME, SETTINGS, RESULTS }
+
+private enum class WatchDebuff(val code: String, val label: String, val color: Int, val symbol: String) {
+    SLOW("SL", "Sluggish", Color.rgb(174, 166, 91), "S"),
+    REVERSE("RV", "Dizzy", Color.rgb(207, 109, 145), "R"),
+    WEAK_FLAME("WF", "Weak Flame", Color.rgb(197, 112, 82), "W"),
+    BOMB_LOCK("BL", "Bomb Lock", Color.rgb(144, 124, 174), "L"),
+    STUN("ST", "Stun", Color.rgb(224, 172, 75), "!"),
+    FRAGILE("FR", "Fragile", Color.rgb(224, 99, 99), "F"),
+    POISON("PS", "Poison", Color.rgb(112, 194, 106), "P"),
+    SHIELD_BREAK("SB", "Shield Break", Color.rgb(92, 152, 199), "X"),
+    DASH_DRAIN("DD", "Dash Drain", Color.rgb(105, 179, 179), "D"),
+    CURSE("CR", "Curse", Color.rgb(156, 110, 183), "C");
+
+    companion object {
+        fun fromCode(code: String): WatchDebuff? = entries.firstOrNull { it.code == code }
+    }
+}
 
 private enum class WatchPowerUp(val code: String, val displayName: String, val color: Int, val symbol: String) {
     FIRE("F+", "Fire Up", Color.rgb(255, 119, 49), "✦"),
@@ -43,6 +60,7 @@ private data class WatchExplosion(
     val range: Int,
     val piercing: Boolean
 )
+private data class WatchMonster(var x: Int, var y: Int, var hidden: Boolean = true)
 
 class WatchGameView(
     context: Context,
@@ -52,17 +70,19 @@ class WatchGameView(
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val rect = RectF()
     private val cellRect = RectF()
-    private val modes = listOf("CARNAGE", "CASUAL", "HARDCORE", "JUGGERNAUT", "RACE")
+    private val modes = listOf("CARNAGE", "CASUAL", "HARDCORE", "JUGGERNAUT", "RACE", "SPLEEF", "SOLO")
     private val mapSizes = listOf(9, 9, 9, 11, 11, 11, 15, 15)
     private var screen = WatchScreen.GAME
     private var mode = 0
     private var selectedMap = 7
     private var board = createBoard(mapSizes[selectedMap])
+    private val monsters = mutableListOf<WatchMonster>()
     private var playerX = 1
     private var playerY = 1
     private var opponentX = 13
     private var opponentY = 13
     private var connectionStatus = "Pair phone, then tap LINK"
+    private var connectedToPhone = false
     private var highContrast = false
     private var effectsEnabled = true
     private var hapticsEnabled = true
@@ -81,7 +101,17 @@ class WatchGameView(
     private var powerUpMessageUntil = 0L
     private var downX = 0f
     private var downY = 0f
-    private var lastTapAt = 0L
+    private var lastMoveAt = 0L
+    private var slowMoves = 0
+    private var reverseMoves = 0
+    private var stunMoves = 0
+    private var poisonMoves = 0
+    private var vulnerableHits = 0
+    private var bombLocked = false
+    private val collectedPowerUps = linkedSetOf<String>()
+    private val collectedDebuffs = linkedSetOf<String>()
+    private var resultTitle = ""
+    private var resultMessage = ""
     private val bombs = mutableListOf<WatchBomb>()
     private val explosions = mutableListOf<WatchExplosion>()
     private val droppedItems = mutableMapOf<Pair<Int, Int>, String>()
@@ -89,7 +119,88 @@ class WatchGameView(
 
     fun setConnectionStatus(status: String) {
         connectionStatus = status
+        connectedToPhone = status == "Connected"
         invalidate()
+    }
+
+    fun handleRemoteCommand(command: String) {
+        when {
+            command.startsWith("MODE:") -> {
+                modes.indexOf(command.substringAfter(':')).takeIf { it >= 0 }?.let { mode = it }
+                invalidate()
+            }
+            command.startsWith("MAP:") -> {
+                selectedMap = (command.substringAfter(':').toIntOrNull() ?: return).coerceIn(mapSizes.indices)
+                invalidate()
+            }
+            command == "START" || command.startsWith("START:") -> {
+                val parts = command.split(':')
+                parts.getOrNull(1)?.let { modeName -> modes.indexOf(modeName).takeIf { it >= 0 }?.let { mode = it } }
+                parts.getOrNull(2)?.toIntOrNull()?.let { selectedMap = it.coerceIn(mapSizes.indices) }
+                startRound()
+            }
+            command.startsWith("RESULT:") -> {
+                val parts = command.removePrefix("RESULT:").split("|", limit = 2)
+                val winner = parts.firstOrNull()?.toIntOrNull() ?: -1
+                resultTitle = when {
+                    modes[mode] == "SOLO" && winner == 0 -> "YOU WIN!"
+                    modes[mode] == "SOLO" -> "GAME OVER"
+                    winner == 1 -> "YOU WIN!"
+                    winner == 0 -> "YOU LOSE"
+                    else -> "DRAW"
+                }
+                resultMessage = parts.getOrNull(1).orEmpty().take(40)
+                bombs.clear()
+                screen = WatchScreen.RESULTS
+                invalidate()
+            }
+            command.startsWith("HOST_POS:") -> {
+                val values = command.substringAfter(':').split(':')
+                val x = values.getOrNull(0)?.toIntOrNull() ?: return
+                val y = values.getOrNull(1)?.toIntOrNull() ?: return
+                if (modes[mode] == "SOLO") {
+                    playerX = x.coerceIn(board.indices)
+                    playerY = y.coerceIn(board.indices)
+                } else {
+                    opponentX = x.coerceIn(board.indices)
+                    opponentY = y.coerceIn(board.indices)
+                }
+                invalidate()
+            }
+            command.startsWith("WATCH_POS:") -> {
+                val values = command.substringAfter(':').split(':')
+                playerX = (values.getOrNull(0)?.toIntOrNull() ?: return).coerceIn(board.indices)
+                playerY = (values.getOrNull(1)?.toIntOrNull() ?: return).coerceIn(board.indices)
+                invalidate()
+            }
+            command.startsWith("DROP:") -> {
+                val values = command.split(':')
+                val x = values.getOrNull(1)?.toIntOrNull() ?: return
+                val y = values.getOrNull(2)?.toIntOrNull() ?: return
+                val code = values.getOrNull(3) ?: return
+                if (x in board.indices && y in board.indices &&
+                    (WatchPowerUp.fromCode(code) != null || WatchDebuff.fromCode(code) != null)
+                ) droppedItems[x to y] = code
+                invalidate()
+            }
+            command.startsWith("BREAK:") -> {
+                val values = command.substringAfter(':').split(':')
+                val x = values.getOrNull(0)?.toIntOrNull() ?: return
+                val y = values.getOrNull(1)?.toIntOrNull() ?: return
+                if (x in board.indices && y in board.indices && board[y][x] == WatchTile.BRICK) {
+                    board[y][x] = WatchTile.FLOOR
+                    monsters.firstOrNull { it.x == x && it.y == y && it.hidden }?.hidden = false
+                }
+                invalidate()
+            }
+            command == "HOST_BOMB" -> placeRemoteBomb(
+                if (modes[mode] == "SOLO") playerX to playerY else opponentX to opponentY, true
+            )
+            command == "WATCH_BOMB" -> placeRemoteBomb(playerX to playerY, true)
+            command == "BOMB" -> placeRemoteBomb(
+                if (modes[mode] == "SOLO") playerX to playerY else opponentX to opponentY, true
+            )
+        }
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -97,6 +208,10 @@ class WatchGameView(
         canvas.drawColor(Color.rgb(4, 7, 13))
         if (screen == WatchScreen.SETTINGS) {
             drawSettings(canvas)
+            return
+        }
+        if (screen == WatchScreen.RESULTS) {
+            drawResults(canvas)
             return
         }
 
@@ -125,15 +240,25 @@ class WatchGameView(
             "1",
             shieldCharges > 0
         )
-        drawPlayer(
-            canvas,
-            left + (opponentX - cameraX + .5f) * cell,
-            top + (opponentY - cameraY + .5f) * cell,
-            cell,
-            Color.rgb(255, 91, 111),
-            "2"
-        )
+        if (modes[mode] != "SOLO") {
+            drawPlayer(
+                canvas,
+                left + (opponentX - cameraX + .5f) * cell,
+                top + (opponentY - cameraY + .5f) * cell,
+                cell,
+                Color.rgb(255, 91, 111),
+                "2"
+            )
+        }
+        monsters.filterNot { it.hidden }.forEach { monster ->
+            drawPlayer(canvas, left + (monster.x - cameraX + .5f) * cell,
+                top + (monster.y - cameraY + .5f) * cell, cell, Color.rgb(148, 202, 82), "M")
+        }
 
+        val powerSummary = collectedPowerUps.toList().takeLast(3).joinToString(" ")
+        val debuffSummary = collectedDebuffs.toList().takeLast(3).joinToString(" ")
+        text(canvas, "P:${powerSummary.ifEmpty { "-" }} D:${debuffSummary.ifEmpty { "-" }}",
+            cx, cy + diameter * .325f, diameter * .016f, Color.rgb(178, 204, 218))
         text(canvas, connectionStatus.take(27), cx, cy + diameter * .377f,
             diameter * .022f, Color.rgb(195, 207, 220))
         if (SystemClock.uptimeMillis() < powerUpMessageUntil) {
@@ -170,10 +295,21 @@ class WatchGameView(
         droppedItems.forEach { (position, code) ->
             val visibleX = position.first - cameraX
             val visibleY = position.second - cameraY
-            val powerUp = WatchPowerUp.fromCode(code) ?: return@forEach
             if (visibleX in 0..8 && visibleY in 0..8) {
-                drawPowerUp(canvas, left + (visibleX + .5f) * cell,
-                    top + (visibleY + .5f) * cell, cell, powerUp)
+                val cx = left + (visibleX + .5f) * cell
+                val cy = top + (visibleY + .5f) * cell
+                val powerUp = WatchPowerUp.fromCode(code)
+                if (powerUp != null) {
+                    drawPowerUp(canvas, cx, cy, cell, powerUp)
+                } else {
+                    val debuff = WatchDebuff.fromCode(code) ?: return@forEach
+                    paint.color = debuff.color
+                    canvas.drawCircle(cx, cy, cell * .3f, paint)
+                    text(canvas, debuff.symbol, cx, cy + cell * .1f, cell * .25f,
+                        Color.WHITE, true)
+                    text(canvas, debuff.code, cx, cy + cell * .41f, cell * .15f,
+                        Color.WHITE, true)
+                }
             }
         }
     }
@@ -250,6 +386,16 @@ class WatchGameView(
                 paint.color = Color.rgb(226, 147, 36)
                 canvas.drawCircle(x + cell / 2f, y + cell / 2f, cell * .09f, paint)
             }
+            WatchTile.HOLE -> {
+                paint.color = Color.rgb(3, 5, 9)
+                canvas.drawRoundRect(cellRect, cell * .08f, cell * .08f, paint)
+                paint.color = Color.rgb(63, 76, 82)
+                paint.strokeWidth = maxOf(1f, cell * .025f)
+                canvas.drawLine(x + cell * .18f, y + cell * .2f,
+                    x + cell * .82f, y + cell * .8f, paint)
+                canvas.drawLine(x + cell * .82f, y + cell * .2f,
+                    x + cell * .18f, y + cell * .8f, paint)
+            }
         }
     }
 
@@ -266,23 +412,19 @@ class WatchGameView(
         while (index >= 0) {
             val bomb = bombs[index]
             val age = now - bomb.plantedAt
-            if (age >= FUSE_MS) {
-                bombs.removeAt(index)
-                explodeBomb(bomb, now)
-                sendCommand("DETONATE")
-            } else {
-                val pulse = 1f + .07f * sin(age / 95f)
-                val x = left + (bomb.x - cameraX + .5f) * cell
-                val y = top + (bomb.y - cameraY + .5f) * cell
-                paint.color = Color.rgb(7, 10, 16)
-                canvas.drawCircle(x, y + cell * .035f, cell * .36f * pulse, paint)
-                paint.color = Color.rgb(29, 34, 46)
-                canvas.drawCircle(x, y, cell * .31f * pulse, paint)
-                paint.color = Color.rgb(94, 105, 124)
-                canvas.drawCircle(x - cell * .1f, y - cell * .1f, cell * .08f, paint)
-                paint.color = if (age % 360L < 180L) Color.rgb(255, 92, 63) else Color.rgb(255, 203, 87)
-                canvas.drawCircle(x + cell * .19f, y - cell * .25f, cell * .075f, paint)
-            }
+            val pulse = 1f + .07f * sin(age / 95f)
+            val x = left + (bomb.x - cameraX + .5f) * cell
+            val y = top + (bomb.y - cameraY + .5f) * cell
+            paint.color = Color.rgb(7, 10, 16)
+            canvas.drawCircle(x, y + cell * .035f, cell * .36f * pulse, paint)
+            paint.color = Color.rgb(29, 34, 46)
+            canvas.drawCircle(x, y, cell * .31f * pulse, paint)
+            paint.color = Color.rgb(94, 105, 124)
+            canvas.drawCircle(x - cell * .1f, y - cell * .1f, cell * .08f, paint)
+            paint.color = if (age % 360L < 180L) Color.rgb(255, 92, 63) else Color.rgb(255, 203, 87)
+            canvas.drawCircle(x + cell * .19f, y - cell * .25f, cell * .075f, paint)
+            text(canvas, "${((FUSE_MS - age).coerceAtLeast(0L) + 999L) / 1000L}",
+                x, y + cell * .47f, cell * .17f, Color.WHITE, true)
             index--
         }
 
@@ -447,6 +589,20 @@ class WatchGameView(
             Color.rgb(125, 239, 184), true)
     }
 
+    private fun drawResults(canvas: Canvas) {
+        val diameter = min(width, height).toFloat()
+        val cx = width / 2f
+        val cy = height / 2f
+        text(canvas, resultTitle, cx, cy - diameter * .18f, diameter * .06f,
+            Color.WHITE, true)
+        text(canvas, resultMessage.take(25), cx, cy - diameter * .08f, diameter * .025f,
+            Color.rgb(170, 197, 216))
+        settingCard(canvas, cx, cy + diameter * .04f, diameter, "REPLAY", "TAP", Color.rgb(125, 239, 184))
+        settingCard(canvas, cx, cy + diameter * .17f, diameter, "PLAY SOLO", "TAP", Color.rgb(77, 201, 220))
+        text(canvas, "MAIN MENU", cx, cy + diameter * .43f, diameter * .024f,
+            Color.rgb(125, 239, 184), true)
+    }
+
     private fun settingCard(canvas: Canvas, cx: Float, cy: Float, diameter: Float, title: String, value: String, accent: Int) {
         rect.set(cx - diameter * .37f, cy - diameter * .052f, cx + diameter * .37f, cy + diameter * .052f)
         paint.color = Color.rgb(17, 26, 40)
@@ -478,6 +634,10 @@ class WatchGameView(
                     invalidate()
                     return true
                 }
+                if (screen == WatchScreen.RESULTS) {
+                    handleResultsTap(event.y)
+                    return true
+                }
                 if (screen == WatchScreen.SETTINGS) {
                     handleSettingsTap(event.y)
                     return true
@@ -498,11 +658,8 @@ class WatchGameView(
             when {
                 x < width * .37f -> {
                     selectedMap = (selectedMap + 1) % mapSizes.size
-                    board = createBoard(mapSizes[selectedMap])
-                    playerX = 1
-                    playerY = 1
-                    opponentX = board.lastIndex - 1
-                    opponentY = board.lastIndex - 1
+                    sendCommand("MAP:$selectedMap")
+                    startRound()
                     resetRoundPowerUps()
                 }
                 x > width * .68f -> screen = WatchScreen.SETTINGS
@@ -510,25 +667,29 @@ class WatchGameView(
             }
         } else if (y < centerY - diameter * .35f) {
             mode = (mode + 1) % modes.size
-            board = createBoard(board.size)
-            resetRoundPowerUps()
+            sendCommand("MODE:${modes[mode]}")
+            startRound()
         } else {
-            val now = SystemClock.uptimeMillis()
-            if (now - lastTapAt < DOUBLE_TAP_MS) {
-                lastTapAt = 0L
-                detonate()
-            } else {
-                lastTapAt = now
-                val thisTap = now
-                postDelayed({
-                    if (lastTapAt == thisTap) {
-                        placeBomb()
-                        lastTapAt = 0L
-                    }
-                }, DOUBLE_TAP_MS)
-            }
+            placeBomb()
         }
         touchFeedback()
+    }
+
+    private fun handleResultsTap(y: Float) {
+        val diameter = min(width, height).toFloat()
+        val cy = height / 2f
+        when {
+            y in (cy - diameter * .02f)..(cy + diameter * .1f) -> startRound()
+            y in (cy + diameter * .11f)..(cy + diameter * .25f) -> {
+                mode = modes.indexOf("SOLO")
+                startRound()
+            }
+            y > cy + diameter * .37f -> {
+                mode = 0
+                startRound()
+            }
+        }
+        invalidate()
     }
 
     private fun handleSettingsTap(y: Float) {
@@ -546,24 +707,31 @@ class WatchGameView(
     }
 
     private fun placeBomb() {
-        if (bombs.none { it.x == playerX && it.y == playerY } && bombs.size < bombCapacity) {
-            bombs.add(WatchBomb(playerX, playerY, SystemClock.uptimeMillis()))
-            sendCommand("BOMB")
-        } else if (bombs.size >= bombCapacity) {
+        if (screen != WatchScreen.GAME || bombLocked) return
+        if (bombs.size >= bombCapacity) {
             lastPowerUpMessage = "BOMB LIMIT · $bombCapacity"
             powerUpMessageUntil = SystemClock.uptimeMillis() + 1400L
+            invalidate()
+            return
         }
-        invalidate()
+        placeRemoteBomb(playerX to playerY)
+        sendCommand("BOMB")
     }
 
-    private fun detonate() {
-        sendCommand("DETONATE")
-        val now = SystemClock.uptimeMillis()
-        if (bombs.isEmpty()) {
-            addExplosion(playerX, playerY, now)
+    private fun placeRemoteBomb(position: Pair<Int, Int>, fromOtherDevice: Boolean = false) {
+        if (screen != WatchScreen.GAME || bombs.any { it.x == position.first && it.y == position.second }) return
+        if (fromOtherDevice || bombs.size < bombCapacity) {
+            val bomb = WatchBomb(position.first, position.second, SystemClock.uptimeMillis())
+            bombs.add(bomb)
+            postDelayed({
+                if (bombs.remove(bomb)) {
+                    explodeBomb(bomb, SystemClock.uptimeMillis())
+                    invalidate()
+                }
+            }, FUSE_MS)
         } else {
-            for (bomb in bombs) explodeBomb(bomb, now)
-            bombs.clear()
+            lastPowerUpMessage = "BOMB LIMIT · $bombCapacity"
+            powerUpMessageUntil = SystemClock.uptimeMillis() + 1400L
         }
         invalidate()
     }
@@ -580,6 +748,7 @@ class WatchGameView(
 
     private fun explodeBomb(bomb: WatchBomb, now: Long) {
         val affectedCells = mutableSetOf(bomb.x to bomb.y)
+        val newlyRevealed = mutableSetOf<Pair<Int, Int>>()
         addExplosion(bomb.x, bomb.y, now)
         val directions = listOf(1 to 0, -1 to 0, 0 to 1, 0 to -1)
         for ((dx, dy) in directions) {
@@ -590,7 +759,17 @@ class WatchGameView(
                 affectedCells.add(x to y)
                 if (board[y][x] == WatchTile.BRICK) {
                     board[y][x] = WatchTile.FLOOR
-                    if (Random.nextInt(100) < 55) droppedItems[x to y] = powerUps.random().code
+                    monsters.firstOrNull { it.x == x && it.y == y && it.hidden }?.let {
+                        it.hidden = false
+                        newlyRevealed.add(x to y)
+                    }
+                    if (!connectedToPhone && modes[mode] != "SPLEEF" && Random.nextInt(100) < 55) {
+                        droppedItems[x to y] = if (Random.nextInt(100) < 25) {
+                            WatchDebuff.entries.random().code
+                        } else {
+                            powerUps.random().code
+                        }
+                    }
                     if (!piercingFlame) break
                 }
             }
@@ -605,27 +784,67 @@ class WatchGameView(
                 }
             }
         }
-        if ((playerX to playerY) in affectedCells) {
-            if (shieldCharges > 0) shieldCharges-- else playerHealth = (playerHealth - 50).coerceAtLeast(0)
+        if (modes[mode] == "SPLEEF") {
+            affectedCells.forEach { (x, y) -> if (x in board.indices && y in board.indices) board[y][x] = WatchTile.HOLE }
         }
-        if ((opponentX to opponentY) in affectedCells) {
-            opponentHealth = (opponentHealth - 50).coerceAtLeast(0)
-            if (vampireFlame) playerHealth = (playerHealth + 20).coerceAtMost(150)
+        if (modes[mode] == "SOLO") {
+            monsters.removeAll { !it.hidden && (it.x to it.y) in affectedCells && (it.x to it.y) !in newlyRevealed }
+        }
+        val hitPlayer = (playerX to playerY) in affectedCells
+        val hitOpponent = modes[mode] != "SOLO" && (opponentX to opponentY) in affectedCells
+        if (modes[mode] == "SPLEEF") {
+            if (hitPlayer || hitOpponent) finishRound(when {
+                hitPlayer && hitOpponent -> null
+                hitPlayer -> 1
+                else -> 0
+            }, "The blast broke the floor under a player.")
+        } else {
+            if (hitPlayer) {
+                if (shieldCharges > 0) shieldCharges-- else {
+                    playerHealth = (playerHealth - if (vulnerableHits > 0) 100 else 50).coerceAtLeast(0)
+                    if (vulnerableHits > 0) vulnerableHits--
+                }
+            }
+            if (hitOpponent) {
+                opponentHealth = (opponentHealth - 50).coerceAtLeast(0)
+                if (vampireFlame) playerHealth = (playerHealth + 20).coerceAtMost(150)
+            }
+            resolveHealthResult()
+        }
+        if (modes[mode] == "SOLO" && screen == WatchScreen.GAME) updateMonsters(affectedCells - newlyRevealed)
+        if (modes[mode] == "SOLO" && monsters.isEmpty() && screen == WatchScreen.GAME) {
+            finishRound(0, "All monsters defeated.")
         }
     }
 
     private fun move(dx: Int, dy: Int) {
-        val x = (playerX + dx).coerceIn(1, board.lastIndex - 1)
-        val y = (playerY + dy).coerceIn(1, board.lastIndex - 1)
+        if (screen != WatchScreen.GAME) return
+        if (stunMoves > 0) {
+            stunMoves--
+            invalidate()
+            return
+        }
+        val moveDx = if (reverseMoves > 0) -dx else dx
+        val moveDy = if (reverseMoves > 0) -dy else dy
+        val x = playerX + moveDx
+        val y = playerY + moveDy
+        if (modes[mode] == "SPLEEF" &&
+            (x !in board.indices || y !in board.indices || board[y][x] == WatchTile.HOLE)
+        ) {
+            finishRound(1, "You fell off the arena.")
+            return
+        }
+        if (x !in board.indices || y !in board.indices) return
+        if (SystemClock.uptimeMillis() - lastMoveAt < if (slowMoves > 0) 800L else 250L) return
         val blockingBomb = bombs.firstOrNull { it.x == x && it.y == y }
         var canMove = board[y][x] != WatchTile.STEEL && board[y][x] != WatchTile.BRICK
         if (blockingBomb != null) {
-            val pushX = x + dx
-            val pushY = y + dy
+            val pushX = x + moveDx
+            val pushY = y + moveDy
             if (canKickBombs && pushX in board.indices && pushY in board.indices &&
                 board[pushY][pushX] != WatchTile.STEEL && board[pushY][pushX] != WatchTile.BRICK &&
                 bombs.none { it !== blockingBomb && it.x == pushX && it.y == pushY } &&
-                (pushX != opponentX || pushY != opponentY)
+                (modes[mode] == "SOLO" || pushX != opponentX || pushY != opponentY)
             ) {
                 bombs[bombs.indexOf(blockingBomb)] = blockingBomb.copy(x = pushX, y = pushY)
             } else {
@@ -635,13 +854,53 @@ class WatchGameView(
         if (canMove) {
             playerX = x
             playerY = y
+            if (board[y][x] == WatchTile.TELEPORT) {
+                val destinationX = board.lastIndex - x
+                val destinationY = board.lastIndex - y
+                if (board[destinationY][destinationX] == WatchTile.FLOOR) {
+                    playerX = destinationX
+                    playerY = destinationY
+                }
+            }
+            lastMoveAt = SystemClock.uptimeMillis()
+            if (reverseMoves > 0) reverseMoves--
+            if (slowMoves > 0) slowMoves--
+            if (poisonMoves > 0) {
+                poisonMoves--
+                playerHealth = (playerHealth - 5).coerceAtLeast(0)
+            }
             droppedItems.remove(x to y)?.let(::collectPowerUp)
+            if (modes[mode] == "SOLO") updateMonsters()
+            if (modes[mode] == "RACE" && board[y][x] == WatchTile.GOAL) finishRound(0, "You reached the center.")
+            resolveHealthResult()
         }
-        sendCommand(if (dx < 0) "LEFT" else if (dx > 0) "RIGHT" else if (dy < 0) "UP" else "DOWN")
+        sendCommand(if (moveDx < 0) "LEFT" else if (moveDx > 0) "RIGHT" else if (moveDy < 0) "UP" else "DOWN")
+        invalidate()
     }
 
     private fun collectPowerUp(code: String) {
+        val debuff = WatchDebuff.fromCode(code)
+        if (debuff != null) {
+            collectedDebuffs.add(debuff.code)
+            when (debuff) {
+                WatchDebuff.SLOW -> slowMoves = 5
+                WatchDebuff.REVERSE -> reverseMoves = 5
+                WatchDebuff.WEAK_FLAME -> blastRange = (blastRange - 1).coerceAtLeast(1)
+                WatchDebuff.BOMB_LOCK -> bombLocked = true
+                WatchDebuff.STUN -> stunMoves = 1
+                WatchDebuff.FRAGILE -> vulnerableHits = 2
+                WatchDebuff.POISON -> poisonMoves = 5
+                WatchDebuff.SHIELD_BREAK -> shieldCharges = 0
+                WatchDebuff.DASH_DRAIN -> dashLevel = (dashLevel - 1).coerceAtLeast(0)
+                WatchDebuff.CURSE -> playerHealth = (playerHealth - 25).coerceAtLeast(0)
+            }
+            lastPowerUpMessage = "DEBUFF · ${debuff.code}"
+            powerUpMessageUntil = SystemClock.uptimeMillis() + 2200L
+            resolveHealthResult()
+            return
+        }
         val powerUp = WatchPowerUp.fromCode(code) ?: return
+        collectedPowerUps.add(code)
         when (powerUp) {
             WatchPowerUp.FIRE -> blastRange = (blastRange + 1).coerceAtMost(8)
             WatchPowerUp.BOMB -> bombCapacity = (bombCapacity + 1).coerceAtMost(5)
@@ -690,7 +949,110 @@ class WatchGameView(
         piercingFlame = false
         playerHealth = 150
         opponentHealth = 150
+        slowMoves = 0
+        reverseMoves = 0
+        stunMoves = 0
+        poisonMoves = 0
+        vulnerableHits = 0
+        bombLocked = false
+        collectedPowerUps.clear()
+        collectedDebuffs.clear()
         powerUpMessageUntil = 0L
+    }
+
+    private fun startRound() {
+        val size = when (modes[mode]) {
+            "SPLEEF" -> 13
+            "RACE" -> 15
+            else -> mapSizes[selectedMap]
+        }
+        board = createBoard(size)
+        if (modes[mode] == "RACE") {
+            for (x in 1..7) board[1][x] = WatchTile.FLOOR
+            for (y in 1..7) board[y][7] = WatchTile.FLOOR
+            for (x in 7..13) board[13][x] = WatchTile.FLOOR
+            for (y in 7..13) board[y][7] = WatchTile.FLOOR
+            board[7][7] = WatchTile.GOAL
+        } else if (modes[mode] != "SPLEEF" && selectedMap > 0) {
+            board[2][1] = WatchTile.TELEPORT
+            board[size - 3][size - 2] = WatchTile.TELEPORT
+        }
+        val remoteMatch = connectedToPhone && modes[mode] != "SOLO"
+        playerX = if (remoteMatch) board.lastIndex - 1 else 1
+        playerY = if (remoteMatch) board.lastIndex - 1 else 1
+        opponentX = if (remoteMatch) 1 else board.lastIndex - 1
+        opponentY = if (remoteMatch) 1 else board.lastIndex - 1
+        monsters.clear()
+        resetRoundPowerUps()
+        lastMoveAt = SystemClock.uptimeMillis() - 1_000L
+        screen = WatchScreen.GAME
+        if (modes[mode] == "SOLO") setupMonsters()
+        invalidate()
+    }
+
+    private fun setupMonsters() {
+        val hidingPlaces = board.indices.flatMap { y ->
+            board[y].indices.mapNotNull { x ->
+                if (board[y][x] == WatchTile.BRICK && x > 2 && y > 2 &&
+                    x < board.lastIndex - 2 && y < board.lastIndex - 2
+                ) x to y else null
+            }
+        }.shuffled().take(4)
+        hidingPlaces.forEach { (x, y) -> monsters.add(WatchMonster(x, y)) }
+    }
+
+    private fun finishRound(winner: Int?, message: String) {
+        if (screen != WatchScreen.GAME) return
+        resultTitle = when {
+            modes[mode] == "SOLO" && winner == 0 -> "YOU WIN!"
+            modes[mode] == "SOLO" -> "GAME OVER"
+            winner == 0 -> "PLAYER 1 WINS"
+            winner == 1 -> "PLAYER 2 WINS"
+            else -> "DRAW"
+        }
+        resultMessage = message
+        bombs.clear()
+        screen = WatchScreen.RESULTS
+        invalidate()
+    }
+
+    private fun resolveHealthResult() {
+        if (modes[mode] == "SOLO") {
+            if (playerHealth <= 0) finishRound(null, "The monsters defeated you.")
+            else if (monsters.isEmpty()) finishRound(0, "All monsters defeated.")
+        } else if (playerHealth <= 0 || opponentHealth <= 0) {
+            val winner = when {
+                playerHealth <= 0 && opponentHealth <= 0 -> null
+                playerHealth <= 0 -> 1
+                else -> 0
+            }
+            finishRound(winner, "A player was eliminated.")
+        }
+    }
+
+    private fun updateMonsters(affectedCells: Set<Pair<Int, Int>> = emptySet()) {
+        if (screen != WatchScreen.GAME) return
+        monsters.removeAll { !it.hidden && (it.x to it.y) in affectedCells }
+        monsters.filterNot { it.hidden }.forEach { monster ->
+            if (kotlin.math.abs(monster.x - playerX) + kotlin.math.abs(monster.y - playerY) > 1) {
+                listOf(1 to 0, -1 to 0, 0 to 1, 0 to -1)
+                    .map { (dx, dy) -> monster.x + dx to monster.y + dy }
+                    .filter { (x, y) ->
+                        x in board.indices && y in board.indices &&
+                            board[y][x] == WatchTile.FLOOR && bombs.none { it.x == x && it.y == y }
+                    }
+                    .minByOrNull { (x, y) -> kotlin.math.abs(x - playerX) + kotlin.math.abs(y - playerY) }
+                    ?.let { (x, y) ->
+                        monster.x = x
+                        monster.y = y
+                    }
+            }
+            if (kotlin.math.abs(monster.x - playerX) + kotlin.math.abs(monster.y - playerY) <= 1) {
+                playerHealth = (playerHealth - 25).coerceAtLeast(0)
+            }
+        }
+        resolveHealthResult()
+        invalidate()
     }
 
     private fun cameraLeft(): Int = if (board.size > 9) (playerX - 4).coerceIn(0, board.size - 9) else 0
@@ -698,6 +1060,7 @@ class WatchGameView(
 
     private fun createBoard(size: Int): Array<Array<WatchTile>> = Array(size) { y -> Array(size) { x ->
         when {
+            modes[mode] == "SPLEEF" -> WatchTile.FLOOR
             x == 0 || y == 0 || x == size - 1 || y == size - 1 -> WatchTile.STEEL
             modes[mode] == "RACE" && x == size / 2 && y == size / 2 -> WatchTile.GOAL
             x % 2 == 0 && y % 2 == 0 -> WatchTile.STEEL
@@ -729,8 +1092,7 @@ class WatchGameView(
     }
 
     companion object {
-        private const val DOUBLE_TAP_MS = 350L
-        private const val FUSE_MS = 1_800L
+        private const val FUSE_MS = 3_000L
         private const val EXPLOSION_MS = 520L
     }
 }

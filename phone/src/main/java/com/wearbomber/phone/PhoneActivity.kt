@@ -58,7 +58,10 @@ class PhoneActivity : Activity() {
                 serverSocket = adapter.listenUsingRfcommWithServiceRecord("WearBomber", GAME_UUID)
                 runOnUiThread { gameView.setConnectionStatus("Waiting for watch…") }
                 clientSocket = serverSocket?.accept()
-                runOnUiThread { gameView.setConnectionStatus("Watch connected") }
+                runOnUiThread {
+                    gameView.setConnectionStatus("Watch connected")
+                    gameView.sendWatchSetup()
+                }
                 clientSocket?.inputStream?.bufferedReader()?.useLines { lines ->
                     lines.forEach { line ->
                         runOnUiThread { gameView.handleRemoteCommand(line) }

@@ -59,6 +59,12 @@ class WatchActivity : Activity() {
                 socket = (device as BluetoothDevice).createRfcommSocketToServiceRecord(GAME_UUID)
                 socket?.connect()
                 runOnUiThread { gameView.setConnectionStatus("Connected") }
+                socket?.inputStream?.bufferedReader()?.useLines { lines ->
+                    lines.forEach { line ->
+                        runOnUiThread { gameView.handleRemoteCommand(line) }
+                    }
+                }
+                runOnUiThread { gameView.setConnectionStatus("Phone disconnected") }
             } catch (error: SecurityException) {
                 runOnUiThread { gameView.setConnectionStatus("Bluetooth permission denied") }
             } catch (error: IOException) {
