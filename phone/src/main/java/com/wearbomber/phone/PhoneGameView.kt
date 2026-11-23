@@ -28,6 +28,22 @@ private enum class Outfit(val color: Int) {
 }
 private enum class Accessory { NONE, CROWN, HORNS, HALO, VISOR, TOP_HAT }
 private enum class Perk { NONE, SHIELD, KICK, PIERCE, REMOTE }
+private enum class PowerUp(val code: String, val displayName: String, val color: Int, val symbol: String) {
+    FIRE("F+", "Fire Up", Color.rgb(255, 119, 49), "✦"),
+    BOMB("B+", "Bomb Up", Color.rgb(255, 198, 71), "●"),
+    DASH("DS", "Dash Boots", Color.rgb(51, 218, 223), "»"),
+    SHIELD("SH", "Energy Shield", Color.rgb(76, 158, 255), "⬡"),
+    KICK("KK", "Bomb Kick", Color.rgb(176, 112, 255), "➤"),
+    BLINK("TP", "Phase Blink", Color.rgb(211, 105, 255), "◎"),
+    VAMPIRE("VM", "Vampire Flame", Color.rgb(255, 76, 115), "♥"),
+    CLUSTER("CL", "Cluster Bomb", Color.rgb(255, 144, 58), "✣"),
+    PIERCE("PR", "Piercing Flame", Color.rgb(255, 91, 67), "↟"),
+    HEART("EX", "Extra Heart", Color.rgb(79, 224, 142), "+");
+
+    companion object {
+        fun fromCode(code: String): PowerUp? = entries.firstOrNull { it.code == code }
+    }
+}
 
 private data class CharacterSpec(
     var maxHp: Int = 150,
@@ -44,9 +60,17 @@ private data class Player(
     val spec: CharacterSpec,
     var lastMoveAt: Long = 0L,
     var blastRange: Int = 2,
+    var bombCapacity: Int = 1,
+    var shieldCharges: Int = 0,
+    var dashLevel: Int = 0,
+    var canKickBombs: Boolean = false,
+    var vampireFlame: Boolean = false,
+    var clusterBombs: Boolean = false,
+    var piercingFlame: Boolean = false,
     val collectedPowerUps: MutableSet<String> = mutableSetOf()
 )
 
+private data class Bomb(var x: Int, var y: Int, val owner: Int)
 private data class BlastEffect(val x: Int, val y: Int, val range: Int, val startedAt: Long)
 
 class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit) : View(context) {
@@ -67,29 +91,18 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
     private var activePlayer = 0
     private var handlingRemoteCommand = false
     private var raceWon = false
-    private var bombs = mutableListOf<Pair<Int, Int>>()
+    private var bombs = mutableListOf<Bomb>()
     private val blastEffects = mutableListOf<BlastEffect>()
     private val droppedItems = mutableMapOf<Pair<Int, Int>, String>()
+    private var showFullPowerUpNames = false
+    private var lastPowerUpMessage = ""
+    private var powerUpMessageUntil = 0L
     private var connectionStatus = "Bluetooth not connected"
     private val maps = listOf(
         "Classic Yard" to 9, "Twin Teleporters" to 9, "Crossfire" to 9, "Blue Maze" to 11,
         "Purple Circuit" to 11, "Labyrinth" to 11, "Long Road" to 15, "Twisted Center" to 15
     )
-    private val powerUps = listOf(
-        "F+" to "Fire Up", "B+" to "Bomb Up", "NK" to "Mega Nuke", "LS" to "Cross Laser",
-        "KK" to "Bomb Kick", "GH" to "Ghost Walk", "SH" to "Shield", "RM" to "Remote Detonator",
-        "SC" to "Scatter Bombs", "DS" to "Dash Boots", "CS" to "Chaos Swap", "VM" to "Vampire Drain",
-        "PR" to "Pierce Blast", "CL" to "Cluster Bomb", "RN" to "Ring of Fire", "DG" to "Diagonal X",
-        "SL" to "Super Laser", "MN" to "Hidden Mine", "MT" to "Meteor Shower", "NP" to "Napalm Trail",
-        "LN" to "Line Bomb", "BH" to "Black Hole", "SW" to "Shockwave", "TP" to "Random Blink",
-        "BD" to "Brick Fortress", "MG" to "Item Magnet", "TW" to "Twin Shot", "WS" to "Wall Smasher",
-        "CF" to "Confuse Enemy", "FR" to "Freeze Enemy", "DI" to "Bomb Diarrhea", "SN" to "Snail Curse",
-        "DK" to "Darkness Curse", "MR" to "Mirror Curse", "JK" to "Jackpot Rain", "BL" to "Blast Boots",
-        "RF" to "Rapid Fire", "EX" to "Extra Life", "UP" to "Upgrade", "IN" to "Invisibility",
-        "PW" to "Power Wave", "RB" to "Rebound", "AG" to "Agility", "SP" to "Speed Trap",
-        "FP" to "Flameproof", "BM" to "Bombardier", "GL" to "Glove", "RV" to "Revive",
-        "ST" to "Stun", "WT" to "Warp Tile"
-    )
+    private val powerUps = PowerUp.entries.toList()
     fun setConnectionStatus(status: String) {
         connectionStatus = status
         invalidate()
@@ -109,6 +122,7 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             }
         } finally {
             handlingRemoteCommand = false
+            invalidate()
         }
     }
 
@@ -121,7 +135,9 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             Screen.CUSTOMIZER -> drawCustomizer(canvas)
             Screen.BUILDER -> drawBuilder(canvas)
         }
-        if (screen == Screen.GAME && (bombs.isNotEmpty() || blastEffects.isNotEmpty())) {
+        if (screen == Screen.GAME && (bombs.isNotEmpty() || blastEffects.isNotEmpty() ||
+                SystemClock.uptimeMillis() < powerUpMessageUntil)
+        ) {
             postInvalidateOnAnimation()
         }
     }
@@ -169,6 +185,8 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             Color.rgb(23, 72, 81))
         button(canvas, "HOST PHONE", w * .51f, actionsY + h * .08f, w * .945f,
             actionsY + h * .145f, Color.rgb(23, 72, 81))
+        button(canvas, "POWER-UP NAMES  ·  ${if (showFullPowerUpNames) "FULL" else "SHORT"}",
+            w * .055f, h * .795f, w * .945f, h * .86f, Color.rgb(35, 54, 74))
         text(canvas, connectionStatus, w * .075f, h * .916f, unit * .02f,
             Color.rgb(158, 177, 201))
         button(canvas, "START MATCH", w * .055f, h * .936f, w * .945f, h * .987f,
@@ -199,6 +217,10 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         drawHealthBar(canvas, w * .715f, h * .064f, w * .915f, h * .078f,
             active.hp.toFloat() / maxHp.coerceAtLeast(1))
         drawBoard(canvas, RectF(w * .045f, h * .115f, w * .955f, h * .555f))
+        if (SystemClock.uptimeMillis() < powerUpMessageUntil) {
+            text(canvas, lastPowerUpMessage, w * .5f, h * .583f, unit * .018f,
+                Color.rgb(255, 221, 130), true, Paint.Align.CENTER)
+        }
         drawControls(canvas)
         if (raceWon) {
             text(canvas, connectionStatus, w * .5f, h * .91f, unit * .025f,
@@ -234,32 +256,21 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         droppedItems.forEach { (position, code) ->
             val (x, y) = position
             if (x in 0 until cols && y in 0 until rows) {
-                tileBounds.set(left + x * cell + cell * .17f, top + y * cell + cell * .17f,
-                    left + (x + 1) * cell - cell * .17f, top + (y + 1) * cell - cell * .17f)
-                paint.color = when (code) {
-                    "F+", "NK", "LS", "PR", "SL" -> Color.rgb(245, 132, 57)
-                    "SH", "RM", "GH", "IN", "FP" -> Color.rgb(72, 157, 231)
-                    "DK", "MR", "CF", "FR", "SN" -> Color.rgb(173, 93, 220)
-                    else -> Color.rgb(91, 205, 126)
+                PowerUp.fromCode(code)?.let {
+                    drawPowerUp(canvas, left + (x + .5f) * cell, top + (y + .5f) * cell, cell, it)
                 }
-                canvas.drawRoundRect(tileBounds, cell * .12f, cell * .12f, paint)
-                paint.color = Color.argb(100, 255, 255, 255)
-                canvas.drawRoundRect(tileBounds.left + cell * .025f, tileBounds.top + cell * .025f,
-                    tileBounds.right - cell * .025f, tileBounds.top + cell * .1f,
-                    cell * .04f, cell * .04f, paint)
-                text(canvas, code, tileBounds.centerX(), tileBounds.centerY() + cell * .08f, cell * .32f,
-                    Color.BLACK, true, Paint.Align.CENTER)
             }
         }
-        bombs.forEach { (x, y) ->
-            drawBomb(canvas, left + (x + .5f) * cell, top + (y + .5f) * cell, cell)
+        bombs.forEach { bomb ->
+            drawBomb(canvas, left + (bomb.x + .5f) * cell, top + (bomb.y + .5f) * cell, cell)
         }
         drawBlastEffects(canvas, left, top, cell)
         players.forEachIndexed { index, player ->
             val cx = left + (player.x + .5f) * cell
             val cy = top + (player.y + .5f) * cell
             val size = cell * if (selectedMode == GameMode.JUGGERNAUT && index == juggernautPlayer) .86f else .7f
-            drawCharacter(canvas, cx, cy, size, player.spec.outfit.color, player.spec.accessory, "${index + 1}")
+            drawCharacter(canvas, cx, cy, size, player.spec.outfit.color, player.spec.accessory,
+                "${index + 1}", player.shieldCharges > 0)
             if (selectedMode == GameMode.JUGGERNAUT && index == juggernautPlayer) {
                 text(canvas, "${player.hp}", cx, cy + cell * .47f, cell * .2f, Color.WHITE, true, Paint.Align.CENTER)
             }
@@ -302,6 +313,24 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         text(canvas, "P2  ${players[1].hp} HP", w * .73f, h * .94f, unit * .023f,
             if (activePlayer == 1) Color.rgb(255, 139, 151) else Color.rgb(165, 181, 197),
             true, Paint.Align.CENTER)
+    }
+
+    private fun drawPowerUp(canvas: Canvas, cx: Float, cy: Float, cell: Float, powerUp: PowerUp) {
+        paint.color = Color.argb(55, Color.red(powerUp.color), Color.green(powerUp.color), Color.blue(powerUp.color))
+        canvas.drawCircle(cx, cy, cell * .43f, paint)
+        paint.color = Color.rgb(12, 19, 30)
+        canvas.drawCircle(cx, cy, cell * .34f, paint)
+        paint.color = powerUp.color
+        canvas.drawCircle(cx, cy, cell * .29f, paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = maxOf(1f, cell * .035f)
+        paint.color = Color.argb(210, 255, 255, 255)
+        canvas.drawCircle(cx, cy, cell * .29f, paint)
+        paint.style = Paint.Style.FILL
+        text(canvas, powerUp.symbol, cx, cy + cell * .08f, cell * .3f,
+            Color.WHITE, true, Paint.Align.CENTER)
+        text(canvas, powerUp.code, cx, cy + cell * .4f, cell * .15f,
+            Color.WHITE, true, Paint.Align.CENTER)
     }
 
     private fun drawHealthBar(canvas: Canvas, left: Float, top: Float, right: Float, bottom: Float, health: Float) {
@@ -438,6 +467,8 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         } else if (y in (actionsY + h * .08f)..(actionsY + h * .145f)) {
             if (x < width * .5f) selectedMap = (selectedMap + 1) % maps.size
             else onHostRequested?.invoke()
+        } else if (y in h * .795f..h * .86f) {
+            showFullPowerUpNames = !showFullPowerUpNames
         } else if (y > h * .94f) {
             startGame()
         }
@@ -530,6 +561,7 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         blastEffects.clear()
         droppedItems.clear()
         raceWon = false
+        powerUpMessageUntil = 0L
         startPlayers()
     }
 
@@ -546,31 +578,45 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         if (selectedMode == GameMode.RACE && raceWon) return
         val player = players[activePlayer]
         val now = System.currentTimeMillis()
-        val cooldown = if (selectedMode == GameMode.JUGGERNAUT && activePlayer == juggernautPlayer) {
+        val baseCooldown = if (selectedMode == GameMode.JUGGERNAUT && activePlayer == juggernautPlayer) {
             850L
         } else {
             player.spec.speed.cooldown
         }
+        val cooldown = (baseCooldown - player.dashLevel * 65L).coerceAtLeast(120L)
         if (now - player.lastMoveAt < cooldown) return
         val nx = (player.x + dx).coerceIn(0, board.lastIndex)
         val ny = (player.y + dy).coerceIn(0, board.lastIndex)
         if (board[ny][nx] == Tile.STEEL) return
+        val blockingBomb = bombs.firstOrNull { it.x == nx && it.y == ny }
+        if (blockingBomb != null) {
+            val pushX = nx + dx
+            val pushY = ny + dy
+            if (!player.canKickBombs || pushX !in board.indices || pushY !in board.indices ||
+                board[pushY][pushX] == Tile.STEEL || board[pushY][pushX] == Tile.BRICK ||
+                bombs.any { it !== blockingBomb && it.x == pushX && it.y == pushY } ||
+                players.any { it !== player && it.x == pushX && it.y == pushY }
+            ) return
+            blockingBomb.x = pushX
+            blockingBomb.y = pushY
+        }
         if (selectedMode == GameMode.JUGGERNAUT && activePlayer == juggernautPlayer && board[ny][nx] == Tile.BRICK) {
             board[ny][nx] = Tile.FLOOR
         } else if (board[ny][nx] == Tile.BRICK) return
         player.x = nx
         player.y = ny
         player.lastMoveAt = now
-        droppedItems.remove(nx to ny)?.let { code ->
-            player.collectedPowerUps.add(code)
-            if (code == "F+") player.blastRange = (player.blastRange + 1).coerceAtMost(8)
-        }
         if (board[ny][nx] == Tile.TELEPORT) {
-            player.x = board.size - 2 - nx + 1
-            player.y = board.size - 2 - ny + 1
-            player.x = player.x.coerceIn(1, board.lastIndex - 1)
-            player.y = player.y.coerceIn(1, board.lastIndex - 1)
+            val teleportX = (board.size - 1 - nx).coerceIn(1, board.lastIndex - 1)
+            val teleportY = (board.size - 1 - ny).coerceIn(1, board.lastIndex - 1)
+            if (bombs.none { it.x == teleportX && it.y == teleportY } &&
+                players.none { it !== player && it.x == teleportX && it.y == teleportY }
+            ) {
+                player.x = teleportX
+                player.y = teleportY
+            }
         }
+        droppedItems.remove(nx to ny)?.let { collectPowerUp(player, it) }
         if (selectedMode == GameMode.RACE && board[ny][nx] == Tile.GOAL) {
             raceWon = true
             connectionStatus = "P${activePlayer + 1} wins the race!"
@@ -582,36 +628,84 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
 
     private fun placeBomb() {
         val player = players[activePlayer]
-        if (bombs.none { it.first == player.x && it.second == player.y }) bombs.add(player.x to player.y)
+        if (bombs.any { it.x == player.x && it.y == player.y }) return
+        if (bombs.count { it.owner == activePlayer } >= player.bombCapacity) {
+            lastPowerUpMessage = "BOMB LIMIT  ·  ${player.bombCapacity}"
+            powerUpMessageUntil = SystemClock.uptimeMillis() + 1400L
+            invalidate()
+            return
+        }
+        val bomb = Bomb(player.x, player.y, activePlayer)
+        bombs.add(bomb)
         if (!handlingRemoteCommand) sendToWatch("BOMB")
         if (selectedMode == GameMode.HARDCORE) {
-            val position = player.x to player.y
-            postDelayed({ if (bombs.contains(position)) detonate() }, 700L)
+            postDelayed({ if (bombs.contains(bomb)) detonate() }, 700L)
         }
+    }
+
+    private fun collectPowerUp(player: Player, code: String) {
+        val powerUp = PowerUp.fromCode(code) ?: return
+        player.collectedPowerUps.add(code)
+        when (powerUp) {
+            PowerUp.FIRE -> player.blastRange = (player.blastRange + 1).coerceAtMost(8)
+            PowerUp.BOMB -> player.bombCapacity = (player.bombCapacity + 1).coerceAtMost(5)
+            PowerUp.DASH -> player.dashLevel = (player.dashLevel + 1).coerceAtMost(4)
+            PowerUp.SHIELD -> player.shieldCharges = (player.shieldCharges + 1).coerceAtMost(3)
+            PowerUp.KICK -> player.canKickBombs = true
+            PowerUp.BLINK -> {
+                val destination = randomSafeFloor()
+                player.x = destination.first
+                player.y = destination.second
+            }
+            PowerUp.VAMPIRE -> player.vampireFlame = true
+            PowerUp.CLUSTER -> player.clusterBombs = true
+            PowerUp.PIERCE -> player.piercingFlame = true
+            PowerUp.HEART -> {
+                val maxHp = if (selectedMode == GameMode.JUGGERNAUT && players.indexOf(player) == juggernautPlayer) {
+                    2250
+                } else {
+                    player.spec.maxHp
+                }
+                player.hp = (player.hp + 50).coerceAtMost(maxHp)
+            }
+        }
+        lastPowerUpMessage = if (showFullPowerUpNames) {
+            "POWER UP  ·  ${powerUp.displayName}"
+        } else {
+            "POWER UP  ·  ${powerUp.code}"
+        }
+        powerUpMessageUntil = SystemClock.uptimeMillis() + 2200L
+    }
+
+    private fun randomSafeFloor(): Pair<Int, Int> {
+        val safeFloors = mutableListOf<Pair<Int, Int>>()
+        for (y in 1 until board.lastIndex) for (x in 1 until board.lastIndex) {
+            if (board[y][x] == Tile.FLOOR && bombs.none { it.x == x && it.y == y } &&
+                players.none { it.x == x && it.y == y }
+            ) safeFloors.add(x to y)
+        }
+        return safeFloors.randomOrNull() ?: (players[activePlayer].x to players[activePlayer].y)
     }
 
     private fun detonate() {
         val now = SystemClock.uptimeMillis()
-        bombs.toList().forEach { (bx, by) ->
-            val range = if (selectedMode == GameMode.JUGGERNAUT && activePlayer == juggernautPlayer) 4
-                else players[activePlayer].blastRange
-            blastEffects.add(BlastEffect(bx, by, range, now))
-            players.forEachIndexed { index, player ->
-                if ((player.x == bx && kotlin.math.abs(player.y - by) <= range) ||
-                    (player.y == by && kotlin.math.abs(player.x - bx) <= range)
-                ) {
-                    if (selectedMode == GameMode.RACE) {
-                        val last = board.size - 2
-                        player.x = if (index == 0) 1 else last
-                        player.y = if (index == 0) 1 else last
-                    } else {
-                        player.hp = (player.hp - 50).coerceAtLeast(0)
-                    }
-                }
+        val directions = listOf(1 to 0, -1 to 0, 0 to 1, 0 to -1)
+        bombs.toList().forEach { bomb ->
+            val owner = players[bomb.owner]
+            val range = if (selectedMode == GameMode.JUGGERNAUT && bomb.owner == juggernautPlayer) {
+                4
+            } else {
+                owner.blastRange
             }
-            for (step in 1..range) {
-                listOf(bx + step to by, bx - step to by, bx to by + step, bx to by - step).forEach { (x, y) ->
-                    if (x in 0..board.lastIndex && y in 0..board.lastIndex && board[y][x] == Tile.BRICK) {
+            val affectedCells = mutableSetOf(bomb.x to bomb.y)
+            blastEffects.add(BlastEffect(bomb.x, bomb.y, range, now))
+            for ((dx, dy) in directions) {
+                for (step in 1..range) {
+                    val x = bomb.x + dx * step
+                    val y = bomb.y + dy * step
+                    if (x !in board.indices || y !in board.indices || board[y][x] == Tile.STEEL) break
+                    affectedCells.add(x to y)
+                    if (board[y][x] == Tile.BRICK) {
                         board[y][x] = Tile.FLOOR
                         val dropChance = when (selectedMode) {
                             GameMode.CARNAGE -> 85
@@ -619,15 +713,47 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
                             GameMode.HARDCORE, GameMode.RACE -> 0
                         }
                         if (Random.nextInt(100) < dropChance) {
-                            val available = when (selectedMode) {
-                                GameMode.CASUAL -> listOf("F+", "B+", "KK")
-                                GameMode.JUGGERNAUT -> listOf(
-                                    "F+", "B+", "KK", "NK", "LS", "PR", "CL", "SL", "WS", "BH", "SW", "MT", "RN"
-                                )
-                                else -> powerUps.map { it.first }
-                            }
-                            droppedItems[x to y] = available.random()
+                            droppedItems[x to y] = powerUps.random().code
                         }
+                        if (!owner.piercingFlame) break
+                    }
+                }
+            }
+            if (owner.clusterBombs) {
+                for ((dx, dy) in directions) {
+                    val x = bomb.x + dx * 2
+                    val y = bomb.y + dy * 2
+                    if (x in board.indices && y in board.indices && board[y][x] != Tile.STEEL) {
+                        blastEffects.add(BlastEffect(x, y, 1, now))
+                        affectedCells.add(x to y)
+                        for ((extraDx, extraDy) in directions) {
+                            val extraX = x + extraDx
+                            val extraY = y + extraDy
+                            if (extraX in board.indices && extraY in board.indices &&
+                                board[extraY][extraX] != Tile.STEEL
+                            ) affectedCells.add(extraX to extraY)
+                        }
+                    }
+                }
+            }
+            players.forEachIndexed { index, player ->
+                if ((player.x to player.y) in affectedCells) {
+                    if (player.shieldCharges > 0) {
+                        player.shieldCharges--
+                    } else if (selectedMode == GameMode.RACE) {
+                        val last = board.size - 2
+                        player.x = if (index == 0) 1 else last
+                        player.y = if (index == 0) 1 else last
+                    } else {
+                        player.hp = (player.hp - 50).coerceAtLeast(0)
+                    }
+                    if (index != bomb.owner && owner.vampireFlame) {
+                        val maxHp = if (selectedMode == GameMode.JUGGERNAUT && bomb.owner == juggernautPlayer) {
+                            2250
+                        } else {
+                            owner.spec.maxHp
+                        }
+                        owner.hp = (owner.hp + 20).coerceAtMost(maxHp)
                     }
                 }
             }
@@ -883,9 +1009,17 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         size: Float,
         color: Int,
         accessory: Accessory,
-        label: String
+        label: String,
+        shielded: Boolean = false
     ) {
         val radius = size * .5f
+        if (shielded) {
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = maxOf(1f, radius * .08f)
+            paint.color = Color.argb(190, 96, 191, 255)
+            canvas.drawCircle(cx, cy, radius * .94f, paint)
+            paint.style = Paint.Style.FILL
+        }
         paint.color = Color.argb(100, 0, 0, 0)
         canvas.drawOval(cx - radius * .72f, cy + radius * .6f, cx + radius * .72f,
             cy + radius * .95f, paint)
