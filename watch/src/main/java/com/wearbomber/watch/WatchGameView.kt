@@ -9,6 +9,7 @@ import android.os.SystemClock
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import java.util.Random as JavaRandom
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.min
@@ -16,7 +17,7 @@ import kotlin.math.sin
 import kotlin.random.Random
 
 private enum class WatchTile { FLOOR, STEEL, BRICK, TELEPORT, GOAL, HOLE }
-private enum class WatchScreen { GAME, SETTINGS, RESULTS }
+private enum class WatchScreen { MENU, GAME, SETTINGS, RESULTS }
 
 private enum class WatchDebuff(
     val code: String,
@@ -78,7 +79,7 @@ class WatchGameView(
     private val cellRect = RectF()
     private val modes = listOf("CARNAGE", "CASUAL", "HARDCORE", "JUGGERNAUT", "RACE", "SPLEEF", "SOLO")
     private val mapSizes = listOf(9, 9, 9, 11, 11, 11, 15, 15)
-    private var screen = WatchScreen.GAME
+    private var screen = WatchScreen.MENU
     private var mode = 0
     private var selectedMap = 7
     private var board = createBoard(mapSizes[selectedMap])
@@ -98,6 +99,8 @@ class WatchGameView(
     private var effectsEnabled = true
     private var hapticsEnabled = true
     private var showFullPowerUpNames = false
+    private var jumpScaresEnabled = true
+    private var jumpScareUntil = 0L
     private var bombCapacity = 1
     private var blastRange = 2
     private var shieldCharges = 0
@@ -146,7 +149,41 @@ class WatchGameView(
                 val parts = command.split(':')
                 parts.getOrNull(1)?.let { modeName -> modes.indexOf(modeName).takeIf { it >= 0 }?.let { mode = it } }
                 parts.getOrNull(2)?.toIntOrNull()?.let { selectedMap = it.coerceIn(mapSizes.indices) }
-                startRound()
+                val seed = parts.getOrNull(3)?.toLongOrNull()
+                startRound(seed)
+            }
+            command.startsWith("MAPBOARD:") -> {
+                val payload = command.substringAfter(':')
+                val size = payload.substringBefore(':').toIntOrNull() ?: return
+                val encoded = payload.substringAfter(':', "")
+                if (size < 3 || encoded.length != size * size) return
+                board = Array(size) { y ->
+                    Array(size) { x ->
+                        when (encoded[y * size + x]) {
+                            'S' -> WatchTile.STEEL
+                            'B' -> WatchTile.BRICK
+                            'T' -> WatchTile.TELEPORT
+                            'G' -> WatchTile.GOAL
+                            'H' -> WatchTile.HOLE
+                            else -> WatchTile.FLOOR
+                        }
+                    }
+                }
+                playerX = 1
+                playerY = 1
+                opponentX = board.lastIndex - 1
+                opponentY = board.lastIndex - 1
+                playerWalkFromX = playerX
+                playerWalkFromY = playerY
+                opponentWalkFromX = opponentX
+                opponentWalkFromY = opponentY
+                bombs.clear()
+                explosions.clear()
+                droppedItems.clear()
+                monsters.clear()
+                resetRoundPowerUps()
+                screen = WatchScreen.GAME
+                invalidate()
             }
             command.startsWith("RESULT:") -> {
                 val parts = command.removePrefix("RESULT:").split("|", limit = 2)
@@ -248,6 +285,10 @@ class WatchGameView(
         val now = SystemClock.uptimeMillis()
         expireDebuffs(now)
         canvas.drawColor(Color.rgb(4, 7, 13))
+        if (screen == WatchScreen.MENU) {
+            drawWatchMenu(canvas)
+            return
+        }
         if (screen == WatchScreen.SETTINGS) {
             drawSettings(canvas)
             return
@@ -317,6 +358,10 @@ class WatchGameView(
                 diameter * .021f, Color.rgb(255, 221, 130), true)
         }
         drawNavigation(canvas, cx, cy, diameter)
+        if (SystemClock.uptimeMillis() < jumpScareUntil) {
+            drawJumpScare(canvas)
+            postInvalidateOnAnimation()
+        }
 
         if (bombs.isNotEmpty() || explosions.isNotEmpty() ||
             SystemClock.uptimeMillis() < powerUpMessageUntil ||
@@ -663,6 +708,39 @@ class WatchGameView(
         return (fromX + (x - fromX) * progress) to (fromY + (y - fromY) * progress)
     }
 
+    private fun drawWatchMenu(canvas: Canvas) {
+        val diameter = min(width, height).toFloat()
+        val cx = width / 2f
+        val cy = height / 2f
+        text(canvas, "WEAR BOMBER", cx, cy - diameter * .38f, diameter * .055f, Color.WHITE, true)
+        text(canvas, "MAIN MENU", cx, cy - diameter * .29f, diameter * .027f,
+            Color.rgb(111, 226, 238), true)
+        settingCard(canvas, cx, cy - diameter * .16f, diameter, "MODE",
+            modes[mode], Color.rgb(77, 201, 220))
+        settingCard(canvas, cx, cy - diameter * .025f, diameter, "MAP",
+            "${selectedMap + 1}/${mapSizes.size}", Color.rgb(255, 198, 71))
+        settingCard(canvas, cx, cy + diameter * .11f, diameter, "START",
+            "TAP", Color.rgb(125, 239, 184))
+        settingCard(canvas, cx, cy + diameter * .245f, diameter, "SETTINGS",
+            "TAP", Color.rgb(211, 183, 255))
+        text(canvas, connectionStatus.take(24), cx, cy + diameter * .39f, diameter * .021f,
+            Color.rgb(195, 207, 220), true)
+    }
+
+    private fun drawJumpScare(canvas: Canvas) {
+        val diameter = min(width, height).toFloat()
+        val cx = width / 2f
+        val cy = height / 2f
+        canvas.drawColor(Color.rgb(225, 20, 38))
+        paint.color = Color.rgb(255, 240, 220)
+        canvas.drawCircle(cx - diameter * .16f, cy - diameter * .12f, diameter * .09f, paint)
+        canvas.drawCircle(cx + diameter * .16f, cy - diameter * .12f, diameter * .09f, paint)
+        paint.color = Color.BLACK
+        canvas.drawCircle(cx - diameter * .16f, cy - diameter * .12f, diameter * .035f, paint)
+        canvas.drawCircle(cx + diameter * .16f, cy - diameter * .12f, diameter * .035f, paint)
+        text(canvas, "BOO!", cx, cy + diameter * .29f, diameter * .14f, Color.WHITE, true)
+    }
+
     private fun drawNavigation(canvas: Canvas, cx: Float, cy: Float, diameter: Float) {
         val y = cy + diameter * .432f
         val radius = diameter * .047f
@@ -691,9 +769,11 @@ class WatchGameView(
             if (highContrast) "HIGH" else "STANDARD", Color.rgb(77, 201, 220))
         settingCard(canvas, cx, cy + diameter * .10f, diameter, "POWER-UP NAMES",
             if (showFullPowerUpNames) "FULL" else "SHORT", Color.rgb(211, 183, 255))
-        settingCard(canvas, cx, cy + diameter * .225f, diameter, "TOUCH HAPTICS",
+        settingCard(canvas, cx, cy + diameter * .215f, diameter, "JUMP-SCARE",
+            if (jumpScaresEnabled) "ON" else "OFF", Color.rgb(255, 92, 111))
+        settingCard(canvas, cx, cy + diameter * .33f, diameter, "TOUCH HAPTICS",
             if (hapticsEnabled) "ON" else "OFF", Color.rgb(174, 127, 255))
-        text(canvas, "TAP A ROW TO CHANGE", cx, cy + diameter * .34f, diameter * .021f,
+        text(canvas, "TAP A ROW TO CHANGE", cx, cy + diameter * .405f, diameter * .018f,
             Color.rgb(164, 180, 198), true)
         text(canvas, "BACK", cx, cy + diameter * .43f, diameter * .024f,
             Color.rgb(125, 239, 184), true)
@@ -748,6 +828,10 @@ class WatchGameView(
                     handleResultsTap(event.y)
                     return true
                 }
+                if (screen == WatchScreen.MENU) {
+                    handleMenuTap(event.x, event.y)
+                    return true
+                }
                 if (screen == WatchScreen.SETTINGS) {
                     handleSettingsTap(event.y)
                     return true
@@ -785,6 +869,27 @@ class WatchGameView(
         touchFeedback()
     }
 
+    private fun handleMenuTap(x: Float, y: Float) {
+        val diameter = min(width, height).toFloat()
+        val cy = height / 2f
+        when {
+            y in (cy - diameter * .22f)..(cy - diameter * .10f) ->
+                mode = (mode + 1) % modes.size
+            y in (cy - diameter * .085f)..(cy + diameter * .035f) -> {
+                selectedMap = (selectedMap + 1) % mapSizes.size
+                sendCommand("MAP:$selectedMap")
+            }
+            y in (cy + diameter * .05f)..(cy + diameter * .17f) -> {
+                sendCommand("MODE:${modes[mode]}")
+                startRound()
+            }
+            y in (cy + diameter * .185f)..(cy + diameter * .305f) -> screen = WatchScreen.SETTINGS
+            y > cy + diameter * .34f -> connect()
+        }
+        touchFeedback()
+        invalidate()
+    }
+
     private fun handleResultsTap(y: Float) {
         val diameter = min(width, height).toFloat()
         val cy = height / 2f
@@ -795,8 +900,7 @@ class WatchGameView(
                 startRound()
             }
             y > cy + diameter * .37f -> {
-                mode = 0
-                startRound()
+                screen = WatchScreen.MENU
             }
         }
         invalidate()
@@ -809,8 +913,9 @@ class WatchGameView(
             y in (cy - diameter * .19f)..(cy - diameter * .07f) -> effectsEnabled = !effectsEnabled
             y in (cy - diameter * .075f)..(cy + diameter * .045f) -> highContrast = !highContrast
             y in (cy + diameter * .04f)..(cy + diameter * .16f) -> showFullPowerUpNames = !showFullPowerUpNames
-            y in (cy + diameter * .165f)..(cy + diameter * .285f) -> hapticsEnabled = !hapticsEnabled
-            y > cy + diameter * .37f -> screen = WatchScreen.GAME
+            y in (cy + diameter * .155f)..(cy + diameter * .275f) -> jumpScaresEnabled = !jumpScaresEnabled
+            y in (cy + diameter * .27f)..(cy + diameter * .39f) -> hapticsEnabled = !hapticsEnabled
+            y > cy + diameter * .37f -> screen = WatchScreen.MENU
         }
         touchFeedback()
         invalidate()
@@ -1008,12 +1113,12 @@ class WatchGameView(
             if (WatchDebuff.POISON in activeDebuffs) {
                 playerHealth = (playerHealth - 5).coerceAtLeast(0)
             }
-            droppedItems.remove(x to y)?.let(::collectPowerUp)
+            droppedItems.remove(playerX to playerY)?.let(::collectPowerUp)
             if (modes[mode] == "SOLO") updateMonsters()
             if (modes[mode] == "RACE" && board[y][x] == WatchTile.GOAL) finishRound(0, "You reached the center.")
             resolveHealthResult()
         }
-        sendCommand(if (moveDx < 0) "LEFT" else if (moveDx > 0) "RIGHT" else if (moveDy < 0) "UP" else "DOWN")
+        sendCommand(if (dx < 0) "LEFT" else if (dx > 0) "RIGHT" else if (dy < 0) "UP" else "DOWN")
         invalidate()
     }
 
@@ -1069,6 +1174,10 @@ class WatchGameView(
             "${powerUp.code} PICKED UP"
         }
         powerUpMessageUntil = SystemClock.uptimeMillis() + 2200L
+        if (jumpScaresEnabled && Random.nextInt(100) < 10) {
+            jumpScareUntil = SystemClock.uptimeMillis() + 650L
+            touchFeedback()
+        }
     }
 
     private fun randomSafeFloor(): Pair<Int, Int> {
@@ -1104,13 +1213,13 @@ class WatchGameView(
         powerUpMessageUntil = 0L
     }
 
-    private fun startRound() {
+    private fun startRound(seed: Long? = null) {
         val size = when (modes[mode]) {
             "SPLEEF" -> 13
             "RACE" -> 15
             else -> mapSizes[selectedMap]
         }
-        board = createBoard(size)
+        board = createBoard(size, seed)
         if (modes[mode] == "RACE") {
             for (x in 1..7) board[1][x] = WatchTile.FLOOR
             for (y in 1..7) board[y][7] = WatchTile.FLOOR
@@ -1232,16 +1341,24 @@ class WatchGameView(
     private fun cameraLeft(): Int = if (board.size > 9) (playerX - 4).coerceIn(0, board.size - 9) else 0
     private fun cameraTop(): Int = if (board.size > 9) (playerY - 4).coerceIn(0, board.size - 9) else 0
 
-    private fun createBoard(size: Int): Array<Array<WatchTile>> = Array(size) { y -> Array(size) { x ->
-        when {
-            modes[mode] == "SPLEEF" -> WatchTile.FLOOR
-            x == 0 || y == 0 || x == size - 1 || y == size - 1 -> WatchTile.STEEL
-            modes[mode] == "RACE" && x == size / 2 && y == size / 2 -> WatchTile.GOAL
-            x % 2 == 0 && y % 2 == 0 -> WatchTile.STEEL
-            (x + y) % 4 == 0 -> WatchTile.BRICK
-            else -> WatchTile.FLOOR
+    private fun createBoard(size: Int, seed: Long? = null): Array<Array<WatchTile>> {
+        val random = JavaRandom(seed ?: 0L)
+        return Array(size) { y -> Array(size) { x ->
+            when {
+                modes[mode] == "SPLEEF" -> WatchTile.FLOOR
+                x == 0 || y == 0 || x == size - 1 || y == size - 1 || (x % 2 == 0 && y % 2 == 0) -> WatchTile.STEEL
+                random.nextInt(100) < (if (modes[mode] == "CARNAGE") 55 else 40) -> WatchTile.BRICK
+                else -> WatchTile.FLOOR
+            }
+        } }.also { map ->
+            map[1][1] = WatchTile.FLOOR
+            map[1][2] = WatchTile.FLOOR
+            map[2][1] = WatchTile.FLOOR
+            map[size - 2][size - 2] = WatchTile.FLOOR
+            map[size - 2][size - 3] = WatchTile.FLOOR
+            map[size - 3][size - 2] = WatchTile.FLOOR
         }
-    } }
+    }
 
     private fun text(
         canvas: Canvas,

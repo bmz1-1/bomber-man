@@ -6,8 +6,10 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.os.SystemClock
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import java.util.Random as JavaRandom
 import kotlin.math.min
 import kotlin.random.Random
 
@@ -135,9 +137,12 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
     private val blastEffects = mutableListOf<BlastEffect>()
     private val droppedItems = mutableMapOf<Pair<Int, Int>, String>()
     private var showFullPowerUpNames = false
+    private var jumpScaresEnabled = true
+    private var jumpScareUntil = 0L
     private var lastPowerUpMessage = ""
     private var powerUpMessageUntil = 0L
     private var connectionStatus = "Bluetooth not connected"
+    private var mapSeed = 0L
     private var screenTransitionStartedAt = 0L
     private var heldMove: Pair<Int, Int>? = null
     private var holdingMovement = false
@@ -179,7 +184,8 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
                 GameMode.entries.firstOrNull { it.name == modeName }?.let { selectedMode = it }
             }
             parts.getOrNull(2)?.toIntOrNull()?.let { selectedMap = it.coerceIn(maps.indices) }
-            startGame()
+            parts.getOrNull(3)?.toLongOrNull()?.let { mapSeed = it }
+            startGame(preserveSeed = true)
             return
         }
         if (command.startsWith("CHAIN:")) {
@@ -189,7 +195,7 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             bombs.firstOrNull { it.x == x && it.y == y }?.let { detonate(it, fromChain = true) }
             return
         }
-        activePlayer = 1
+        activePlayer = if (selectedMode == GameMode.SOLO) 0 else 1
         handlingRemoteCommand = true
         try {
             when (command) {
@@ -244,6 +250,10 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         }
         canvas.restore()
         if (layer >= 0) canvas.restoreToCount(layer)
+        if (SystemClock.uptimeMillis() < jumpScareUntil) {
+            drawJumpScare(canvas)
+            postInvalidateOnAnimation()
+        }
         if (transitionProgress < 1f) postInvalidateOnAnimation()
         if (screen == Screen.GAME && (bombs.isNotEmpty() || blastEffects.isNotEmpty() ||
                 SystemClock.uptimeMillis() < powerUpMessageUntil)
@@ -548,6 +558,21 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             Color.rgb(24, 153, 117))
     }
 
+    private fun drawJumpScare(canvas: Canvas) {
+        val unit = min(width, height).toFloat()
+        val cx = width / 2f
+        val cy = height / 2f
+        canvas.drawColor(Color.rgb(225, 20, 38))
+        paint.color = Color.rgb(255, 240, 220)
+        canvas.drawCircle(cx - unit * .13f, cy - unit * .08f, unit * .055f, paint)
+        canvas.drawCircle(cx + unit * .13f, cy - unit * .08f, unit * .055f, paint)
+        paint.color = Color.BLACK
+        canvas.drawCircle(cx - unit * .13f, cy - unit * .08f, unit * .024f, paint)
+        canvas.drawCircle(cx + unit * .13f, cy - unit * .08f, unit * .024f, paint)
+        paint.style = Paint.Style.FILL
+        text(canvas, "BOO!", cx, cy + unit * .28f, unit * .12f, Color.WHITE, true)
+    }
+
     private fun drawSettings(canvas: Canvas) {
         val w = width.toFloat()
         val h = height.toFloat()
@@ -561,14 +586,15 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             unit * .019f, Color.rgb(158, 177, 201))
         button(canvas, "POWER-UP NAMES  ·  ${if (showFullPowerUpNames) "FULL" else "SHORT"}",
             w * .1f, h * .36f, w * .9f, h * .43f, Color.rgb(35, 57, 76))
-        drawPanel(canvas, RectF(w * .07f, h * .47f, w * .93f, h * .68f),
+        button(canvas, "JUMP-SCARE  ·  ${if (jumpScaresEnabled) "ON" else "OFF"}",
+            w * .1f, h * .45f, w * .9f, h * .52f,
+            if (jumpScaresEnabled) Color.rgb(132, 48, 70) else Color.rgb(35, 57, 76))
+        drawPanel(canvas, RectF(w * .07f, h * .55f, w * .93f, h * .68f),
             Color.rgb(16, 26, 40), Color.rgb(38, 63, 81))
-        text(canvas, "HOLD TO MOVE", w * .12f, h * .52f, unit * .025f,
+        text(canvas, "HOLD TO MOVE", w * .12f, h * .59f, unit * .025f,
             Color.WHITE, true)
-        text(canvas, "Keep a direction pressed to move repeatedly.", w * .12f, h * .57f,
+        text(canvas, "Keep a direction pressed to move repeatedly.", w * .12f, h * .64f,
             unit * .019f, Color.rgb(158, 177, 201))
-        text(canvas, "Movement speed can be changed in Characters.", w * .12f, h * .62f,
-            unit * .018f, Color.rgb(158, 177, 201))
         button(canvas, "BACK TO MENU", w * .1f, h * .86f, w * .9f, h * .93f,
             Color.rgb(24, 153, 117))
     }
@@ -797,6 +823,7 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
     private fun handleSettingsTap(x: Float, y: Float) {
         when {
             y in height * .36f..height * .43f -> showFullPowerUpNames = !showFullPowerUpNames
+            y in height * .45f..height * .52f -> jumpScaresEnabled = !jumpScaresEnabled
             y > height * .84f -> changeScreen(Screen.LOBBY)
             y < height * .12f && x < width * .25f -> changeScreen(Screen.LOBBY)
         }
@@ -822,8 +849,15 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             board = Array(11) { row -> builder[row].clone() }
             selectedMap = 7
             changeScreen(Screen.GAME)
+            bombs.clear()
+            blastEffects.clear()
+            droppedItems.clear()
+            monsters.clear()
             raceWon = false
+            powerUpMessageUntil = 0L
             startPlayers()
+            sendToWatch("START:${selectedMode.name}:$selectedMap:$mapSeed")
+            sendToWatch("MAPBOARD:${board.size}:${encodeBoard()}")
             return
         }
         if (y !in height * .17f..height * .76f) return
@@ -843,16 +877,17 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         }
     }
 
-    private fun startGame() {
+    private fun startGame(preserveSeed: Boolean = false) {
         val size = when (selectedMode) {
             GameMode.RACE -> 15
             GameMode.SPLEEF -> 13
             else -> maps[selectedMap].second
         }
+        if (!preserveSeed) mapSeed = System.nanoTime()
         board = if (selectedMode == GameMode.SPLEEF) {
             Array(size) { Array(size) { Tile.FLOOR } }
         } else {
-            emptyBoard(size)
+            emptyBoard(size, mapSeed)
         }
         if (selectedMode == GameMode.RACE) {
             for (x in 1..7) board[1][x] = Tile.FLOOR
@@ -872,7 +907,7 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         raceWon = false
         powerUpMessageUntil = 0L
         startPlayers()
-        sendToWatch("START:${selectedMode.name}:$selectedMap")
+        sendToWatch("START:${selectedMode.name}:$selectedMap:$mapSeed")
         if (selectedMode == GameMode.SOLO) {
             val monsterBricks = board.indices.flatMap { y ->
                 board[y].indices.mapNotNull { x -> if (board[y][x] == Tile.BRICK) x to y else null }
@@ -1101,6 +1136,10 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
             "POWER UP  ·  ${powerUp.code}"
         }
         powerUpMessageUntil = SystemClock.uptimeMillis() + 2200L
+        if (jumpScaresEnabled && Random.nextInt(100) < 10) {
+            jumpScareUntil = SystemClock.uptimeMillis() + 650L
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        }
     }
 
     private fun applyDebuff(player: Player, debuff: Debuff) {
@@ -1286,10 +1325,12 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         invalidate()
     }
 
-    private fun emptyBoard(size: Int): Array<Array<Tile>> = Array(size) { y -> Array(size) { x ->
+    private fun emptyBoard(size: Int, seed: Long = mapSeed): Array<Array<Tile>> {
+        val random = JavaRandom(seed)
+        return Array(size) { y -> Array(size) { x ->
         when {
             x == 0 || y == 0 || x == size - 1 || y == size - 1 || (x % 2 == 0 && y % 2 == 0) -> Tile.STEEL
-            Random.nextInt(100) < (if (selectedMode == GameMode.CARNAGE) 55 else 40) -> Tile.BRICK
+            random.nextInt(100) < (if (selectedMode == GameMode.CARNAGE) 55 else 40) -> Tile.BRICK
             else -> Tile.FLOOR
         }
     } }.also { map ->
@@ -1299,6 +1340,24 @@ class PhoneGameView(context: Context, private val sendToWatch: (String) -> Unit)
         map[size - 2][size - 2] = Tile.FLOOR
         map[size - 2][size - 3] = Tile.FLOOR
         map[size - 3][size - 2] = Tile.FLOOR
+    }
+    }
+
+    private fun encodeBoard(): String = buildString {
+        board.forEach { row ->
+            row.forEach { tile ->
+                append(
+                    when (tile) {
+                        Tile.FLOOR -> 'F'
+                        Tile.STEEL -> 'S'
+                        Tile.BRICK -> 'B'
+                        Tile.TELEPORT -> 'T'
+                        Tile.GOAL -> 'G'
+                        Tile.HOLE -> 'H'
+                    }
+                )
+            }
+        }
     }
 
     private fun drawBackground(canvas: Canvas) {
